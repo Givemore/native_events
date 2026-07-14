@@ -81,21 +81,21 @@ const STEPS = [
   },
   {
     id: 'full_name',
-    message: "What's your full name?",
+    message: "1. What's your full name?",
     field: 'full_name',
     type: 'text',
     required: true
   },
   {
     id: 'company',
-    message: "What's your company or organisation?",
+    message: "2. What's your company or organisation?",
     field: 'company',
     type: 'text',
     required: true
   },
   {
     id: 'email',
-    message: "What's your email address?",
+    message: "3. What's your email address?",
     field: 'email',
     type: 'text',
     required: true,
