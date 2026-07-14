@@ -81,21 +81,21 @@ const STEPS = [
   },
   {
     id: 'full_name',
-    message: "1. What's your full name?",
+    message: "1/29. What's your full name?",
     field: 'full_name',
     type: 'text',
     required: true
   },
   {
     id: 'company',
-    message: "2. What's your company or organisation?",
+    message: "2/29. What's your company or organisation?",
     field: 'company',
     type: 'text',
     required: true
   },
   {
     id: 'email',
-    message: "3. What's your email address?",
+    message: "3/29. What's your email address?",
     field: 'email',
     type: 'text',
     required: true,
@@ -103,14 +103,14 @@ const STEPS = [
   },
   {
     id: 'phone',
-    message: "What's your phone number?\n\nReply *same* to use this WhatsApp number.",
+    message: "4/29. What's your phone number?\n\nReply *same* to use this WhatsApp number.",
     field: 'phone',
     type: 'text',
     required: true
   },
   {
     id: 'preferred_contact',
-    message: 'How would you prefer us to contact you?',
+    message: '5/29. How would you prefer us to contact you?',
     field: 'preferred_contact',
     type: 'buttons',
     options: [
@@ -121,56 +121,56 @@ const STEPS = [
   },
   {
     id: 'event_type',
-    message: 'What type of event are you planning?',
+    message: '6/29. What type of event are you planning?',
     field: 'event_type',
     type: 'list',
     options: EVENT_TYPES.map((t) => ({ id: t, title: t.slice(0, 24) }))
   },
   {
     id: 'event_name',
-    message: "What's the name of your event?",
+    message: "7/29. What's the name of your event?",
     field: 'event_name',
     type: 'text',
     required: true
   },
   {
     id: 'event_date',
-    message: "What's the event date? (e.g. 15 Sept 2026)",
+    message: "8/29. What's the event date? (e.g. 15 Sept 2026)",
     field: 'event_date',
     type: 'text',
     required: true
   },
   {
     id: 'alternative_date',
-    message: 'Do you have an alternative date? Reply *skip* if none.',
+    message: '9/29. Do you have an alternative date? Reply *skip* if none.',
     field: 'alternative_date',
     type: 'text',
     required: false
   },
   {
     id: 'event_start_time',
-    message: 'What time does the event start? (e.g. 09:00)',
+    message: '10/29. What time does the event start? (e.g. 09:00)',
     field: 'event_start_time',
     type: 'text',
     required: true
   },
   {
     id: 'event_end_time',
-    message: 'What time does the event end? (e.g. 17:00)',
+    message: '11/29. What time does the event end? (e.g. 17:00)',
     field: 'event_end_time',
     type: 'text',
     required: true
   },
   {
     id: 'venue',
-    message: 'Where is the event taking place (venue)?',
+    message: '12/29. Where is the event taking place (venue)?',
     field: 'venue',
     type: 'text',
     required: true
   },
   {
     id: 'venue_confirmed',
-    message: 'Is the venue confirmed?',
+    message: '13/29. Is the venue confirmed?',
     field: 'venue_confirmed',
     type: 'buttons',
     options: [
@@ -180,14 +180,14 @@ const STEPS = [
   },
   {
     id: 'expected_guests',
-    message: 'How many guests are you expecting?',
+    message: '14/29. How many guests are you expecting?',
     field: 'expected_guests',
     type: 'text',
     required: true
   },
   {
     id: 'vip_guests',
-    message: 'Will there be VIP guests?',
+    message: '15/29. Will there be VIP guests?',
     field: 'vip_guests',
     type: 'buttons',
     options: [
@@ -198,7 +198,7 @@ const STEPS = [
   },
   {
     id: 'indoor_outdoor',
-    message: 'Will the event be indoor or outdoor?',
+    message: '16/29. Will the event be indoor or outdoor?',
     field: 'indoor_outdoor',
     type: 'buttons',
     options: [
@@ -209,34 +209,34 @@ const STEPS = [
   },
   {
     id: 'theme',
-    message: 'Do you have a theme or concept? Reply *skip* if none.',
+    message: '17/29. Do you have a theme or concept? Reply *skip* if none.',
     field: 'theme',
     type: 'text',
     required: false
   },
   {
     id: 'event_objectives',
-    message: 'What are the main objectives of this event?',
+    message: '18/29. What are the main objectives of this event?',
     field: 'event_objectives',
     type: 'text',
     required: true
   },
   {
     id: 'target_audience',
-    message: 'Who is the target audience?',
+    message: '19/29. Who is the target audience?',
     field: 'target_audience',
     type: 'text',
     required: true
   },
   {
     id: 'services_required',
-    message: 'Which services do you need?',
+    message: '20/29. Which services do you need?',
     field: 'services_required',
     type: 'services'
   },
   {
     id: 'has_budget',
-    message: 'Do you have an estimated budget?',
+    message: '21/29. Do you have an estimated budget?',
     field: 'has_budget',
     type: 'buttons',
     options: [
@@ -247,7 +247,7 @@ const STEPS = [
   },
   {
     id: 'budget_range',
-    message: 'What is your estimated budget range?',
+    message: '22/29. What is your estimated budget range?',
     field: 'budget_range',
     type: 'list',
     options: BUDGET_RANGES.map((t) => ({ id: t, title: t.slice(0, 24) })),
@@ -255,14 +255,14 @@ const STEPS = [
   },
   {
     id: 'quotation_needed_by',
-    message: 'When do you need the quotation?',
+    message: '23/29. When do you need the quotation?',
     field: 'quotation_needed_by',
     type: 'text',
     required: true
   },
   {
     id: 'is_urgent',
-    message: 'Is this enquiry urgent?',
+    message: '24/29. Is this enquiry urgent?',
     field: 'is_urgent',
     type: 'buttons',
     options: [
@@ -272,7 +272,7 @@ const STEPS = [
   },
   {
     id: 'decision_deadline',
-    message: 'When is your decision deadline? Reply *skip* if none.',
+    message: '25/29. When is your decision deadline? Reply *skip* if none.',
     field: 'decision_deadline',
     type: 'text',
     required: false
@@ -280,20 +280,20 @@ const STEPS = [
   {
     id: 'supporting_documents',
     message:
-      'You can send supporting documents now (event brief, floor plans, mood boards, brand guidelines, etc.).\n\nSend files here, or reply *skip* / *done* to continue.',
+      '26/29. You can send supporting documents now (event brief, floor plans, mood boards, brand guidelines, etc.).\n\nSend files here, or reply *skip* / *done* to continue.',
     field: 'documents',
     type: 'upload'
   },
   {
     id: 'additional_requirements',
-    message: "Is there anything else you'd like us to know about your event? Reply *skip* if none.",
+    message: "27/29. Is there anything else you'd like us to know about your event? Reply *skip* if none.",
     field: 'additional_requirements',
     type: 'text',
     required: false
   },
   {
     id: 'consent_contact',
-    message: 'Do you agree to be contacted about this enquiry?',
+    message: '28/29. Do you agree to be contacted about this enquiry?',
     field: 'consent_contact',
     type: 'buttons',
     options: [
@@ -303,7 +303,7 @@ const STEPS = [
   },
   {
     id: 'consent_marketing',
-    message: 'May we send proposals and marketing communications?',
+    message: '29/29. May we send proposals and marketing communications?',
     field: 'consent_marketing',
     type: 'buttons',
     options: [
