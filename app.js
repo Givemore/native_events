@@ -77,7 +77,7 @@ const STEPS = [
       "Welcome to Native Events. We'd love to help bring your event to life. I'll ask a few quick questions so our team can prepare a tailored quotation for you.\n\nTap *Get started* when you're ready.",
     field: null,
     type: 'buttons',
-    options: [{ id: 'start', title: 'Get started' }]
+    options: [{ id: 'get_started', title: 'Get started' }]
   },
   {
     id: 'full_name',
@@ -336,36 +336,48 @@ function nextStepId(currentId, data) {
 
 async function waPost(payload) {
   if (!whatsappToken || !phoneNumberId) {
-    console.log('[DEV] Would send WhatsApp:', JSON.stringify(payload, null, 2));
-    return null;
+    console.error(
+      '❌ Cannot send WhatsApp reply: set WHATSAPP_TOKEN (or ACCESS_TOKEN) and PHONE_NUMBER_ID on Render.'
+    );
+    console.log('[DEV] Would send:', JSON.stringify(payload, null, 2));
+    return { error: { message: 'Missing WHATSAPP_TOKEN or PHONE_NUMBER_ID' } };
   }
   const url = `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${whatsappToken}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) console.error('WhatsApp API error:', res.status, data);
-  return data;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${whatsappToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error('❌ WhatsApp API error:', res.status, JSON.stringify(data, null, 2));
+    } else {
+      console.log('✅ Sent', payload.type, 'to', payload.to);
+    }
+    return data;
+  } catch (err) {
+    console.error('❌ WhatsApp send failed:', err.message);
+    return { error: { message: err.message } };
+  }
 }
 
 async function sendText(to, body) {
   return waPost({
     messaging_product: 'whatsapp',
-    to,
+    to: String(to).replace(/\D/g, ''), // digits only
     type: 'text',
-    text: { body: String(body).slice(0, 4096) }
+    text: { preview_url: false, body: String(body).slice(0, 4096) }
   });
 }
 
 async function sendButtons(to, body, options) {
-  return waPost({
+  const payload = {
     messaging_product: 'whatsapp',
-    to,
+    to: String(to).replace(/\D/g, ''),
     type: 'interactive',
     interactive: {
       type: 'button',
@@ -377,13 +389,19 @@ async function sendButtons(to, body, options) {
         }))
       }
     }
-  });
+  };
+  const result = await waPost(payload);
+  if (result?.error) {
+    const lines = options.map((o, i) => `${i + 1}. ${o.title}`).join('\n');
+    return sendText(to, `${body}\n\n${lines}\n\nReply with the option text or number.`);
+  }
+  return result;
 }
 
 async function sendList(to, body, buttonLabel, options) {
-  return waPost({
+  const payload = {
     messaging_product: 'whatsapp',
-    to,
+    to: String(to).replace(/\D/g, ''),
     type: 'interactive',
     interactive: {
       type: 'list',
@@ -401,7 +419,13 @@ async function sendList(to, body, buttonLabel, options) {
         ]
       }
     }
-  });
+  };
+  const result = await waPost(payload);
+  if (result?.error) {
+    const lines = options.map((o, i) => `${i + 1}. ${o.title}`).join('\n');
+    return sendText(to, `${body}\n\n${lines}\n\nReply with the option text or number.`);
+  }
+  return result;
 }
 
 async function markRead(messageId) {
@@ -629,7 +653,12 @@ async function handleMessage(from, message) {
 
   let session = getSession(from);
 
-  if (isRestart || !session || session.step === 'complete') {
+  // "Get started" button id used to be "start", which matched isRestart and
+  // re-showed welcome forever. Still treat start/get_started on welcome as continue.
+  const advancingWelcome =
+    session?.step === 'welcome' && /^(start|get[_ ]?started|continue)$/i.test(text);
+
+  if ((isRestart || !session || session.step === 'complete') && !advancingWelcome) {
     if (session?.step === 'complete' && !isRestart) {
       await sendText(from, 'Your enquiry is already submitted. Reply *start* to begin a new one.');
       return;
@@ -772,34 +801,58 @@ app.get('/', (req, res) => {
 });
 
 app.post('/', async (req, res) => {
+  // Always ACK immediately so Meta does not retry
   res.status(200).end();
 
   const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
   console.log(`\nWebhook received ${timestamp}`);
+  console.log(JSON.stringify(req.body, null, 2));
 
   try {
-    const body = req.body;
+    const body = req.body || {};
     if (body.object !== 'whatsapp_business_account') {
-      console.log(JSON.stringify(body, null, 2));
+      console.log('Ignoring non-WhatsApp payload');
       return;
     }
 
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change.value;
-        if (!value?.messages) continue;
+        // Status updates (delivered/read) — ignore
+        if (!value?.messages?.length) {
+          if (value?.statuses) console.log('Status update (ignored)');
+          continue;
+        }
 
         for (const message of value.messages) {
           const from = message.from;
-          console.log(`From ${from} (${message.type})`);
-          markRead(message.id).catch(() => {});
-          await handleMessage(from, message);
+          console.log(`Incoming from ${from} type=${message.type}`);
+          try {
+            await markRead(message.id);
+          } catch (_) {}
+          try {
+            await handleMessage(from, message);
+          } catch (err) {
+            console.error('handleMessage error:', err);
+            await sendText(from, 'Sorry, something went wrong. Please reply *start* to try again.').catch(() => {});
+          }
         }
       }
     }
   } catch (err) {
     console.error('Webhook error:', err);
   }
+});
+
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    verifyTokenSet: Boolean(verifyToken),
+    whatsappTokenSet: Boolean(whatsappToken),
+    phoneNumberIdSet: Boolean(phoneNumberId),
+    phoneNumberIdPreview: phoneNumberId ? `${String(phoneNumberId).slice(0, 4)}…` : null,
+    apiVersion
+  });
 });
 
 // ─── Sales dashboard API ────────────────────────────────────────────────────
@@ -946,8 +999,10 @@ app.patch('/api/enquiries/:id', (req, res) => {
 app.listen(port, () => {
   console.log(`\nNative Events WhatsApp chatbot listening on port ${port}`);
   console.log('Webhook: GET/POST /');
+  console.log('Health:  GET /health');
   console.log('Admin:   /admin\n');
-  if (!verifyToken) console.warn('WARN: VERIFY_TOKEN not set');
-  if (!whatsappToken) console.warn('WARN: WHATSAPP_TOKEN / ACCESS_TOKEN not set');
-  if (!phoneNumberId) console.warn('WARN: PHONE_NUMBER_ID not set');
+  console.log('Config check:');
+  console.log('  VERIFY_TOKEN:     ', verifyToken ? '✓ set' : '✗ MISSING');
+  console.log('  WHATSAPP_TOKEN:   ', whatsappToken ? '✓ set' : '✗ MISSING');
+  console.log('  PHONE_NUMBER_ID:  ', phoneNumberId ? '✓ set' : '✗ MISSING');
 });
