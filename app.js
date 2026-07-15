@@ -2,14 +2,19 @@
  * Native Events — WhatsApp Client Enquiry Chatbot
  * Hosted on Render · Webhook for Meta WhatsApp Cloud API
  *
+ * Enquiries are POSTed to the PHP API on cPanel (dashboard lives there too).
+ *
  * Env (Render):
  *   VERIFY_TOKEN       — Meta webhook verify token
  *   WHATSAPP_TOKEN     — Cloud API access token (or ACCESS_TOKEN)
  *   PHONE_NUMBER_ID    — WhatsApp phone number ID
  *   PORT               — set by Render
+ *   DATA_DIR           — WhatsApp session storage (e.g. /var/data on Render)
+ *   PHP_API_URL        — cPanel PHP API base, e.g. https://moeng.io/native_event/api
+ *   PHP_API_KEY        — must match api_key in php/config.local.php
+ *   DASHBOARD_URL      — optional; cPanel CRM URL for email links
  *   NOTIFY_EMAIL       — optional sales alert email
  *   SMTP_HOST/PORT/USER/PASS/FROM — optional SMTP for alerts
- *   APP_URL            — public Render URL (for email links)
  */
 const express = require('express');
 const fs = require('fs');
@@ -25,16 +30,72 @@ const whatsappToken = process.env.WHATSAPP_TOKEN || process.env.ACCESS_TOKEN;
 const phoneNumberId = process.env.PHONE_NUMBER_ID;
 const apiVersion = process.env.WHATSAPP_API_VERSION || 'v21.0';
 
-const dataDir = path.join(__dirname, 'data');
+/** Live CRM API (cPanel). Override with PHP_API_URL for local (e.g. http://127.0.0.1:8080/api). */
+const DEFAULT_PHP_API_URL = 'https://moeng.io/native_event/api';
+const DEFAULT_DASHBOARD_URL = 'https://moeng.io/native_event';
+
+/**
+ * Normalize to .../api/index.php so subdirectory hosts work without mod_rewrite.
+ * Accepts: .../native_event, .../native_event/api, or .../api/index.php
+ */
+function resolvePhpApiEndpoint(raw) {
+  let base = String(raw || DEFAULT_PHP_API_URL).trim().replace(/\/+$/, '');
+  base = base.replace(/\/index\.php$/i, '');
+  if (!/\/api$/i.test(base)) {
+    base = `${base}/api`;
+  }
+  return `${base}/index.php`;
+}
+
+const phpApiEndpoint = resolvePhpApiEndpoint(process.env.PHP_API_URL || DEFAULT_PHP_API_URL);
+const phpApiKey = process.env.PHP_API_KEY || 'dev-secret';
+const dashboardUrl = (process.env.DASHBOARD_URL || DEFAULT_DASHBOARD_URL).replace(/\/$/, '');
+
+const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
 const sessionsFile = path.join(dataDir, 'sessions.json');
-const enquiriesFile = path.join(dataDir, 'enquiries.json');
 
 function ensureData() {
   if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
   if (!fs.existsSync(sessionsFile)) fs.writeFileSync(sessionsFile, '{}');
-  if (!fs.existsSync(enquiriesFile)) fs.writeFileSync(enquiriesFile, '[]');
 }
 ensureData();
+
+/**
+ * Call the PHP enquiry API on cPanel. Only this bot talks to it with X-Api-Key.
+ * POSTs to https://moeng.io/native_event/api/index.php?_route=/enquiries
+ */
+async function phpApi(method, apiPath, { query, body } = {}) {
+  const url = new URL(phpApiEndpoint);
+  const route = apiPath.startsWith('/') ? apiPath : `/${apiPath}`;
+  url.searchParams.set('_route', route);
+  if (query) {
+    Object.entries(query).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        url.searchParams.set(key, String(value));
+      }
+    });
+  }
+  const headers = { 'X-Api-Key': phpApiKey };
+  const opts = { method, headers };
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, opts);
+  const contentType = res.headers.get('content-type') || '';
+  let payload;
+  if (contentType.includes('application/json')) {
+    payload = await res.json();
+  } else {
+    payload = Buffer.from(await res.arrayBuffer());
+  }
+  return {
+    ok: res.ok,
+    status: res.status,
+    contentType,
+    payload
+  };
+}
 
 function readJson(file, fallback) {
   try {
@@ -81,21 +142,21 @@ const STEPS = [
   },
   {
     id: 'full_name',
-    message: "1/29. What's your full name?",
+    message: "What's your full name?",
     field: 'full_name',
     type: 'text',
     required: true
   },
   {
     id: 'company',
-    message: "2/29. What's your company or organisation?",
+    message: "What's your company or organisation?",
     field: 'company',
     type: 'text',
     required: true
   },
   {
     id: 'email',
-    message: "3/29. What's your email address?",
+    message: "What's your email address?",
     field: 'email',
     type: 'text',
     required: true,
@@ -103,14 +164,14 @@ const STEPS = [
   },
   {
     id: 'phone',
-    message: "4/29. What's your phone number?\n\nReply *same* to use this WhatsApp number.",
+    message: "What's your phone number?\n\nReply *same* to use this WhatsApp number.",
     field: 'phone',
     type: 'text',
     required: true
   },
   {
     id: 'preferred_contact',
-    message: '5/29. How would you prefer us to contact you?',
+    message: 'How would you prefer us to contact you?',
     field: 'preferred_contact',
     type: 'buttons',
     options: [
@@ -121,56 +182,56 @@ const STEPS = [
   },
   {
     id: 'event_type',
-    message: '6/29. What type of event are you planning?',
+    message: 'What type of event are you planning?',
     field: 'event_type',
     type: 'list',
     options: EVENT_TYPES.map((t) => ({ id: t, title: t.slice(0, 24) }))
   },
   {
     id: 'event_name',
-    message: "7/29. What's the name of your event?",
+    message: "What's the name of your event?",
     field: 'event_name',
     type: 'text',
     required: true
   },
   {
     id: 'event_date',
-    message: "8/29. What's the event date? (e.g. 15 Sept 2026)",
+    message: "What's the event date? (e.g. 15 Sept 2026)",
     field: 'event_date',
     type: 'text',
     required: true
   },
   {
     id: 'alternative_date',
-    message: '9/29. Do you have an alternative date? Reply *skip* if none.',
+    message: 'Do you have an alternative date? Reply *skip* if none.',
     field: 'alternative_date',
     type: 'text',
     required: false
   },
   {
     id: 'event_start_time',
-    message: '10/29. What time does the event start? (e.g. 09:00)',
+    message: 'What time does the event start? (e.g. 09:00)',
     field: 'event_start_time',
     type: 'text',
     required: true
   },
   {
     id: 'event_end_time',
-    message: '11/29. What time does the event end? (e.g. 17:00)',
+    message: 'What time does the event end? (e.g. 17:00)',
     field: 'event_end_time',
     type: 'text',
     required: true
   },
   {
     id: 'venue',
-    message: '12/29. Where is the event taking place (venue)?',
+    message: 'Where is the event taking place (venue)?',
     field: 'venue',
     type: 'text',
     required: true
   },
   {
     id: 'venue_confirmed',
-    message: '13/29. Is the venue confirmed?',
+    message: 'Is the venue confirmed?',
     field: 'venue_confirmed',
     type: 'buttons',
     options: [
@@ -180,14 +241,14 @@ const STEPS = [
   },
   {
     id: 'expected_guests',
-    message: '14/29. How many guests are you expecting?',
+    message: 'How many guests are you expecting?',
     field: 'expected_guests',
     type: 'text',
     required: true
   },
   {
     id: 'vip_guests',
-    message: '15/29. Will there be VIP guests?',
+    message: 'Will there be VIP guests?',
     field: 'vip_guests',
     type: 'buttons',
     options: [
@@ -198,7 +259,7 @@ const STEPS = [
   },
   {
     id: 'indoor_outdoor',
-    message: '16/29. Will the event be indoor or outdoor?',
+    message: 'Will the event be indoor or outdoor?',
     field: 'indoor_outdoor',
     type: 'buttons',
     options: [
@@ -209,34 +270,34 @@ const STEPS = [
   },
   {
     id: 'theme',
-    message: '17/29. Do you have a theme or concept? Reply *skip* if none.',
+    message: 'Do you have a theme or concept? Reply *skip* if none.',
     field: 'theme',
     type: 'text',
     required: false
   },
   {
     id: 'event_objectives',
-    message: '18/29. What are the main objectives of this event?',
+    message: 'What are the main objectives of this event?',
     field: 'event_objectives',
     type: 'text',
     required: true
   },
   {
     id: 'target_audience',
-    message: '19/29. Who is the target audience?',
+    message: 'Who is the target audience?',
     field: 'target_audience',
     type: 'text',
     required: true
   },
   {
     id: 'services_required',
-    message: '20/29. Which services do you need?',
+    message: 'Which services do you need?',
     field: 'services_required',
     type: 'services'
   },
   {
     id: 'has_budget',
-    message: '21/29. Do you have an estimated budget?',
+    message: 'Do you have an estimated budget?',
     field: 'has_budget',
     type: 'buttons',
     options: [
@@ -247,7 +308,7 @@ const STEPS = [
   },
   {
     id: 'budget_range',
-    message: '22/29. What is your estimated budget range?',
+    message: 'What is your estimated budget range?',
     field: 'budget_range',
     type: 'list',
     options: BUDGET_RANGES.map((t) => ({ id: t, title: t.slice(0, 24) })),
@@ -255,14 +316,14 @@ const STEPS = [
   },
   {
     id: 'quotation_needed_by',
-    message: '23/29. When do you need the quotation?',
+    message: 'When do you need the quotation?',
     field: 'quotation_needed_by',
     type: 'text',
     required: true
   },
   {
     id: 'is_urgent',
-    message: '24/29. Is this enquiry urgent?',
+    message: 'Is this enquiry urgent?',
     field: 'is_urgent',
     type: 'buttons',
     options: [
@@ -272,7 +333,7 @@ const STEPS = [
   },
   {
     id: 'decision_deadline',
-    message: '25/29. When is your decision deadline? Reply *skip* if none.',
+    message: 'When is your decision deadline? Reply *skip* if none.',
     field: 'decision_deadline',
     type: 'text',
     required: false
@@ -280,20 +341,20 @@ const STEPS = [
   {
     id: 'supporting_documents',
     message:
-      '26/29. You can send supporting documents now (event brief, floor plans, mood boards, brand guidelines, etc.).\n\nSend files here, or reply *skip* / *done* to continue.',
+      'You can send supporting documents now (event brief, floor plans, mood boards, brand guidelines, etc.).\n\nSend files here, or reply *skip* / *done* to continue.',
     field: 'documents',
     type: 'upload'
   },
   {
     id: 'additional_requirements',
-    message: "27/29. Is there anything else you'd like us to know about your event? Reply *skip* if none.",
+    message: "Is there anything else you'd like us to know about your event? Reply *skip* if none.",
     field: 'additional_requirements',
     type: 'text',
     required: false
   },
   {
     id: 'consent_contact',
-    message: '28/29. Do you agree to be contacted about this enquiry?',
+    message: 'Do you agree to be contacted about this enquiry?',
     field: 'consent_contact',
     type: 'buttons',
     options: [
@@ -303,7 +364,7 @@ const STEPS = [
   },
   {
     id: 'consent_marketing',
-    message: '29/29. May we send proposals and marketing communications?',
+    message: 'May we send proposals and marketing communications?',
     field: 'consent_marketing',
     type: 'buttons',
     options: [
@@ -506,53 +567,54 @@ function createSession(waId) {
   return session;
 }
 
-function saveEnquiry(waId, data) {
-  const enquiries = readJson(enquiriesFile, []);
+async function saveEnquiry(waId, data) {
   const services = Array.isArray(data.services_required)
     ? data.services_required.join(', ')
     : data.services_required || '';
 
-  const enquiry = {
-    id: randomUUID(),
-    status: 'New',
-    assigned_to: '',
-    internal_notes: '',
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    wa_id: waId,
-    full_name: data.full_name || '',
-    company: data.company || '',
-    email: data.email || '',
-    phone: data.phone || waId,
-    preferred_contact: data.preferred_contact || 'WhatsApp',
-    event_type: data.event_type || '',
-    event_name: data.event_name || '',
-    event_date: data.event_date || '',
-    alternative_date: data.alternative_date || '',
-    event_start_time: data.event_start_time || '',
-    event_end_time: data.event_end_time || '',
-    venue: data.venue || '',
-    venue_confirmed: data.venue_confirmed || '',
-    expected_guests: data.expected_guests || '',
-    vip_guests: data.vip_guests || '',
-    indoor_outdoor: data.indoor_outdoor || '',
-    theme: data.theme || '',
-    event_objectives: data.event_objectives || '',
-    target_audience: data.target_audience || '',
-    services_required: services,
-    has_budget: data.has_budget || '',
-    budget_range: data.budget_range || '',
-    quotation_needed_by: data.quotation_needed_by || '',
-    is_urgent: data.is_urgent || '',
-    decision_deadline: data.decision_deadline || '',
-    additional_requirements: data.additional_requirements || '',
-    documents: data.documents || [],
-    consent_contact: data.consent_contact || '',
-    consent_marketing: data.consent_marketing || ''
-  };
+  const result = await phpApi('POST', '/enquiries', {
+    body: {
+      wa_id: waId,
+      status: 'New',
+      full_name: data.full_name || '',
+      company: data.company || '',
+      email: data.email || '',
+      phone: data.phone || waId,
+      preferred_contact: data.preferred_contact || 'WhatsApp',
+      event_type: data.event_type || '',
+      event_name: data.event_name || '',
+      event_date: data.event_date || '',
+      alternative_date: data.alternative_date || '',
+      event_start_time: data.event_start_time || '',
+      event_end_time: data.event_end_time || '',
+      venue: data.venue || '',
+      venue_confirmed: data.venue_confirmed || '',
+      expected_guests: data.expected_guests || '',
+      vip_guests: data.vip_guests || '',
+      indoor_outdoor: data.indoor_outdoor || '',
+      theme: data.theme || '',
+      event_objectives: data.event_objectives || '',
+      target_audience: data.target_audience || '',
+      services_required: services,
+      has_budget: data.has_budget || '',
+      budget_range: data.budget_range || '',
+      quotation_needed_by: data.quotation_needed_by || '',
+      is_urgent: data.is_urgent || '',
+      decision_deadline: data.decision_deadline || '',
+      additional_requirements: data.additional_requirements || '',
+      documents: data.documents || [],
+      consent_contact: data.consent_contact || '',
+      consent_marketing: data.consent_marketing || '',
+      created_message: 'Enquiry submitted via WhatsApp'
+    }
+  });
 
-  enquiries.unshift(enquiry);
-  writeJson(enquiriesFile, enquiries);
+  if (!result.ok) {
+    const detail = result.payload && result.payload.error ? result.payload.error : `HTTP ${result.status}`;
+    throw new Error(`Failed to save enquiry to PHP API: ${detail}`);
+  }
+
+  const enquiry = result.payload;
   notifyNewEnquiry(enquiry).catch((err) => console.error('Email notify failed:', err.message));
   return enquiry;
 }
@@ -572,7 +634,7 @@ async function notifyNewEnquiry(enquiry) {
       ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
       : undefined
   });
-  const appUrl = process.env.APP_URL || '';
+  const appUrl = dashboardUrl || process.env.APP_URL || '';
   await transporter.sendMail({
     from: process.env.SMTP_FROM || process.env.SMTP_USER,
     to,
@@ -589,7 +651,7 @@ async function notifyNewEnquiry(enquiry) {
       `Budget: ${enquiry.budget_range || enquiry.has_budget}`,
       `Services: ${enquiry.services_required}`,
       `Urgent: ${enquiry.is_urgent}`,
-      appUrl ? `Dashboard: ${appUrl}/admin` : ''
+      appUrl ? `Dashboard: ${appUrl}` : ''
     ].join('\n')
   });
 }
@@ -766,7 +828,17 @@ async function handleMessage(from, message) {
   const next = nextStepId(step.id, data);
 
   if (next === 'complete') {
-    const enquiry = saveEnquiry(from, data);
+    let enquiry;
+    try {
+      enquiry = await saveEnquiry(from, data);
+    } catch (err) {
+      console.error('saveEnquiry failed:', err.message);
+      await sendText(
+        from,
+        'Sorry — we could not save your enquiry right now. Please try again in a moment or reply *start* to begin again.'
+      );
+      return;
+    }
     session.step = 'complete';
     session.data = data;
     session.enquiry_id = enquiry.id;
@@ -794,7 +866,7 @@ app.get('/', (req, res) => {
     console.log('WEBHOOK VERIFIED');
     res.status(200).send(challenge);
   } else if (!mode) {
-    res.status(200).send('Native Events WhatsApp Enquiry Bot is running. Open /admin for the sales dashboard.');
+    res.status(200).send('Native Events WhatsApp Enquiry Bot is running. CRM dashboard is hosted on cPanel (PHP).');
   } else {
     res.status(403).end();
   }
@@ -855,154 +927,18 @@ app.get('/health', (_req, res) => {
   });
 });
 
-// ─── Sales dashboard API ────────────────────────────────────────────────────
-
-app.use('/admin', express.static(path.join(__dirname, 'public')));
-
-app.get('/admin', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
-});
-
-app.get('/api/enquiries', (req, res) => {
-  let list = readJson(enquiriesFile, []);
-  const { search, status } = req.query;
-  if (status) list = list.filter((e) => e.status === status);
-  if (search) {
-    const t = String(search).toLowerCase();
-    list = list.filter(
-      (e) =>
-        (e.full_name || '').toLowerCase().includes(t) ||
-        (e.company || '').toLowerCase().includes(t) ||
-        (e.email || '').toLowerCase().includes(t) ||
-        (e.event_name || '').toLowerCase().includes(t) ||
-        (e.phone || '').includes(t)
-    );
-  }
-  res.json(list);
-});
-
-app.get('/api/enquiries/stats', (_req, res) => {
-  const list = readJson(enquiriesFile, []);
-  res.json({
-    total: list.length,
-    new_count: list.filter((e) => e.status === 'New').length,
-    contacted: list.filter((e) => e.status === 'Contacted').length,
-    quoting: list.filter((e) => e.status === 'Quoting').length,
-    won: list.filter((e) => e.status === 'Won').length,
-    lost: list.filter((e) => e.status === 'Lost').length,
-    urgent: list.filter((e) => e.is_urgent === 'Yes').length
-  });
-});
-
-app.get('/api/enquiries/export/csv', (req, res) => {
-  let list = readJson(enquiriesFile, []);
-  if (req.query.status) list = list.filter((e) => e.status === req.query.status);
-
-  const headers = [
-    'id', 'status', 'created_at', 'full_name', 'company', 'email', 'phone',
-    'preferred_contact', 'event_type', 'event_name', 'event_date', 'venue',
-    'expected_guests', 'services_required', 'budget_range', 'is_urgent',
-    'quotation_needed_by', 'assigned_to', 'internal_notes'
-  ];
-  const escape = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const rows = [headers.join(',')].concat(
-    list.map((e) => headers.map((h) => escape(e[h])).join(','))
-  );
-  res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', 'attachment; filename="enquiries.csv"');
-  res.send(rows.join('\n'));
-});
-
-app.get('/api/enquiries/:id/brief.txt', (req, res) => {
-  const e = readJson(enquiriesFile, []).find((x) => x.id === req.params.id);
-  if (!e) return res.status(404).json({ error: 'Not found' });
-
-  const brief = [
-    'NATIVE EVENTS — EVENT ENQUIRY BRIEF',
-    '===================================',
-    '',
-    'CLIENT DETAILS',
-    `Name: ${e.full_name}`,
-    `Company: ${e.company}`,
-    `Email: ${e.email}`,
-    `Phone: ${e.phone}`,
-    `Preferred contact: ${e.preferred_contact}`,
-    '',
-    'EVENT SUMMARY',
-    `Type: ${e.event_type}`,
-    `Name: ${e.event_name}`,
-    `Date: ${e.event_date}`,
-    `Alternative date: ${e.alternative_date || '—'}`,
-    `Time: ${e.event_start_time} – ${e.event_end_time}`,
-    `Venue: ${e.venue} (confirmed: ${e.venue_confirmed})`,
-    `Guests: ${e.expected_guests}`,
-    `VIP guests: ${e.vip_guests}`,
-    `Indoor/Outdoor: ${e.indoor_outdoor}`,
-    `Theme: ${e.theme || '—'}`,
-    `Objectives: ${e.event_objectives}`,
-    `Target audience: ${e.target_audience}`,
-    '',
-    'SERVICES REQUESTED',
-    e.services_required || '—',
-    '',
-    'BUDGET',
-    `Has budget: ${e.has_budget}`,
-    `Range: ${e.budget_range || '—'}`,
-    '',
-    'TIMELINE',
-    `Quotation needed by: ${e.quotation_needed_by}`,
-    `Urgent: ${e.is_urgent}`,
-    `Decision deadline: ${e.decision_deadline || '—'}`,
-    '',
-    'ADDITIONAL NOTES',
-    e.additional_requirements || '—',
-    '',
-    'DOCUMENTS',
-    (e.documents || []).length
-      ? e.documents.map((d) => `- ${d.name || d.type} (${d.id || ''})`).join('\n')
-      : 'None',
-    '',
-    'META',
-    `Enquiry ID: ${e.id}`,
-    `Submitted: ${e.created_at}`,
-    `Status: ${e.status}`,
-    `Consent contact: ${e.consent_contact}`,
-    `Consent marketing: ${e.consent_marketing}`
-  ].join('\n');
-
-  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename="brief-${e.id.slice(0, 8)}.txt"`);
-  res.send(brief);
-});
-
-app.get('/api/enquiries/:id', (req, res) => {
-  const enquiry = readJson(enquiriesFile, []).find((e) => e.id === req.params.id);
-  if (!enquiry) return res.status(404).json({ error: 'Not found' });
-  res.json(enquiry);
-});
-
-app.patch('/api/enquiries/:id', (req, res) => {
-  const list = readJson(enquiriesFile, []);
-  const idx = list.findIndex((e) => e.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-
-  const { status, assigned_to, internal_notes } = req.body;
-  if (status !== undefined) list[idx].status = status;
-  if (assigned_to !== undefined) list[idx].assigned_to = assigned_to;
-  if (internal_notes !== undefined) list[idx].internal_notes = internal_notes;
-  list[idx].updated_at = new Date().toISOString();
-  writeJson(enquiriesFile, list);
-  res.json(list[idx]);
-});
-
 // Start
 app.listen(port, () => {
   console.log(`\nNative Events WhatsApp chatbot listening on port ${port}`);
   console.log('Webhook: GET/POST /');
   console.log('Health:  GET /health');
-  console.log('Admin:   /admin\n');
+  console.log('CRM:     hosted on cPanel (PHP) — not this service\n');
   console.log('Config check:');
   console.log('  VERIFY_TOKEN:     ', verifyToken ? '✓ set' : '✗ MISSING');
   console.log('  WHATSAPP_TOKEN:   ', whatsappToken ? '✓ set' : '✗ MISSING');
   console.log('  PHONE_NUMBER_ID:  ', phoneNumberId ? '✓ set' : '✗ MISSING');
+  console.log('  DATA_DIR:         ', dataDir);
+  console.log('  PHP_API_URL:      ', phpApiEndpoint);
+  console.log('  PHP_API_KEY:      ', phpApiKey ? '✓ set' : '✗ MISSING');
+  console.log('  DASHBOARD_URL:    ', dashboardUrl || '○ optional');
 });
