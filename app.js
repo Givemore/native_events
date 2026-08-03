@@ -1,944 +1,668 @@
 /**
- * Native Events — WhatsApp Client Enquiry Chatbot
- * Hosted on Render · Webhook for Meta WhatsApp Cloud API
- *
- * Enquiries are POSTed to the PHP API on cPanel (dashboard lives there too).
- *
- * Env (Render):
- *   VERIFY_TOKEN       — Meta webhook verify token
- *   WHATSAPP_TOKEN     — Cloud API access token (or ACCESS_TOKEN)
- *   PHONE_NUMBER_ID    — WhatsApp phone number ID
- *   PORT               — set by Render
- *   DATA_DIR           — WhatsApp session storage (e.g. /var/data on Render)
- *   PHP_API_URL        — cPanel PHP API base, e.g. https://moeng.io/native_event/api
- *   PHP_API_KEY        — must match api_key in php/config.local.php
- *   DASHBOARD_URL      — optional; cPanel CRM URL for email links
- *   NOTIFY_EMAIL       — optional sales alert email
- *   SMTP_HOST/PORT/USER/PASS/FROM — optional SMTP for alerts
+ * Botswana Housing Corporation — Customer Assistant
+ * Menu-driven chatbot following the BHC support flow.
  */
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const { randomUUID } = require('crypto');
 
-const app = express();
-app.use(express.json({ limit: '5mb' }));
+const chatEl = document.getElementById("chat");
+const quickEl = document.getElementById("quickReplies");
+const inputForm = document.getElementById("inputForm");
+const userInput = document.getElementById("userInput");
+const restartBtn = document.getElementById("restartBtn");
 
-const port = process.env.PORT || 3000;
-const verifyToken = process.env.VERIFY_TOKEN;
-const whatsappToken = process.env.WHATSAPP_TOKEN || process.env.ACCESS_TOKEN;
-const phoneNumberId = process.env.PHONE_NUMBER_ID;
-const apiVersion = process.env.WHATSAPP_API_VERSION || 'v21.0';
+const NAV = {
+  MAIN: { id: "__main__", label: "← Main menu" },
+  BACK: { id: "__back__", label: "← Back" },
+};
 
-/** Live CRM API (cPanel). Override with PHP_API_URL for local (e.g. http://127.0.0.1:8080/api). */
-const DEFAULT_PHP_API_URL = 'https://moeng.io/native_event/api';
-const DEFAULT_DASHBOARD_URL = 'https://moeng.io/native_event';
-
-/**
- * Normalize to .../api/index.php so subdirectory hosts work without mod_rewrite.
- * Accepts: .../native_event, .../native_event/api, or .../api/index.php
- */
-function resolvePhpApiEndpoint(raw) {
-  let base = String(raw || DEFAULT_PHP_API_URL).trim().replace(/\/+$/, '');
-  base = base.replace(/\/index\.php$/i, '');
-  if (!/\/api$/i.test(base)) {
-    base = `${base}/api`;
-  }
-  return `${base}/index.php`;
-}
-
-const phpApiEndpoint = resolvePhpApiEndpoint(process.env.PHP_API_URL || DEFAULT_PHP_API_URL);
-const phpApiKey = process.env.PHP_API_KEY || 'dev-secret';
-const dashboardUrl = (process.env.DASHBOARD_URL || DEFAULT_DASHBOARD_URL).replace(/\/$/, '');
-
-const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
-const sessionsFile = path.join(dataDir, 'sessions.json');
-
-function ensureData() {
-  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-  if (!fs.existsSync(sessionsFile)) fs.writeFileSync(sessionsFile, '{}');
-}
-ensureData();
-
-/**
- * Call the PHP enquiry API on cPanel. Only this bot talks to it with X-Api-Key.
- * POSTs to https://moeng.io/native_event/api/index.php?_route=/enquiries
- */
-async function phpApi(method, apiPath, { query, body } = {}) {
-  const url = new URL(phpApiEndpoint);
-  const route = apiPath.startsWith('/') ? apiPath : `/${apiPath}`;
-  url.searchParams.set('_route', route);
-  if (query) {
-    Object.entries(query).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== '') {
-        url.searchParams.set(key, String(value));
-      }
-    });
-  }
-  const headers = { 'X-Api-Key': phpApiKey };
-  const opts = { method, headers };
-  if (body !== undefined) {
-    headers['Content-Type'] = 'application/json';
-    opts.body = JSON.stringify(body);
-  }
-  const res = await fetch(url, opts);
-  const contentType = res.headers.get('content-type') || '';
-  let payload;
-  if (contentType.includes('application/json')) {
-    payload = await res.json();
-  } else {
-    payload = Buffer.from(await res.arrayBuffer());
-  }
-  return {
-    ok: res.ok,
-    status: res.status,
-    contentType,
-    payload
-  };
-}
-
-function readJson(file, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
-  }
-}
-function writeJson(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
-
-// ─── Enquiry flow (matches Native Events brief) ─────────────────────────────
-
-const EVENT_TYPES = [
-  'Conference', 'Corporate Event', 'Product Launch', 'Awards', 'Festival',
-  'Wedding', 'Private Event', 'Exhibition', 'Sports Event', 'Other'
-];
-
-const SERVICES = [
-  'Event Planning', 'Event Management', 'Project Management', 'Stage Design',
-  'Stage Construction', 'Audio', 'Lighting', 'LED Screens', 'Livestream',
-  'Photography', 'Videography', 'Branding', 'Printing', 'Registration System',
-  'Accreditation', 'RSVP Management', 'Guest Management', 'Event Website',
-  'Mobile App', 'Entertainment', 'MC', 'Artists', 'DJs', 'Security', 'Decor',
-  'Furniture', 'Catering', 'Transport', 'Accommodation', 'Staffing',
-  'Exhibition Stands', 'Custom Builds', 'Other'
-];
-
-const BUDGET_RANGES = [
-  'Under P50,000', 'P50k-P100k', 'P100k-P250k',
-  'P250k-P500k', 'Above P500,000', 'Prefer not to say'
-];
-
-/** Ordered conversation steps */
-const STEPS = [
-  {
-    id: 'welcome',
-    message:
-      "Welcome to Native Events. We'd love to help bring your event to life. I'll ask a few quick questions so our team can prepare a tailored quotation for you.\n\nTap *Get started* when you're ready.",
-    field: null,
-    type: 'buttons',
-    options: [{ id: 'get_started', title: 'Get started' }]
-  },
-  {
-    id: 'full_name',
-    message: "What's your full name?",
-    field: 'full_name',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'company',
-    message: "What's your company or organisation?",
-    field: 'company',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'email',
-    message: "What's your email address?",
-    field: 'email',
-    type: 'text',
-    required: true,
-    validate: (v) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? null : 'Please send a valid email address.')
-  },
-  {
-    id: 'phone',
-    message: "What's your phone number?\n\nReply *same* to use this WhatsApp number.",
-    field: 'phone',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'preferred_contact',
-    message: 'How would you prefer us to contact you?',
-    field: 'preferred_contact',
-    type: 'buttons',
+/** Conversation tree — mirrors the BHC flowchart */
+const TREE = {
+  welcome: {
+    message: () =>
+      `<span class="lead">Welcome to Botswana Housing Corporation</span>How can we help you today?`,
     options: [
-      { id: 'Email', title: 'Email' },
-      { id: 'Phone', title: 'Phone' },
-      { id: 'WhatsApp', title: 'WhatsApp' }
-    ]
+      { id: "buy", label: "Buy a House" },
+      { id: "rent", label: "Rent a Property" },
+      { id: "maintenance", label: "Maintenance" },
+      { id: "payments", label: "Payments" },
+      { id: "office", label: "Office Information" },
+      { id: "care", label: "Speak to Customer Care" },
+    ],
   },
-  {
-    id: 'event_type',
-    message: 'What type of event are you planning?',
-    field: 'event_type',
-    type: 'list',
-    options: EVENT_TYPES.map((t) => ({ id: t, title: t.slice(0, 24) }))
-  },
-  {
-    id: 'event_name',
-    message: "What's the name of your event?",
-    field: 'event_name',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'event_date',
-    message: "What's the event date? (e.g. 15 Sept 2026)",
-    field: 'event_date',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'alternative_date',
-    message: 'Do you have an alternative date? Reply *skip* if none.',
-    field: 'alternative_date',
-    type: 'text',
-    required: false
-  },
-  {
-    id: 'event_start_time',
-    message: 'What time does the event start? (e.g. 09:00)',
-    field: 'event_start_time',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'event_end_time',
-    message: 'What time does the event end? (e.g. 17:00)',
-    field: 'event_end_time',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'venue',
-    message: 'Where is the event taking place (venue)?',
-    field: 'venue',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'venue_confirmed',
-    message: 'Is the venue confirmed?',
-    field: 'venue_confirmed',
-    type: 'buttons',
-    options: [
-      { id: 'Yes', title: 'Yes' },
-      { id: 'No', title: 'No' }
-    ]
-  },
-  {
-    id: 'expected_guests',
-    message: 'How many guests are you expecting?',
-    field: 'expected_guests',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'vip_guests',
-    message: 'Will there be VIP guests?',
-    field: 'vip_guests',
-    type: 'buttons',
-    options: [
-      { id: 'Yes', title: 'Yes' },
-      { id: 'No', title: 'No' },
-      { id: 'Not sure', title: 'Not sure' }
-    ]
-  },
-  {
-    id: 'indoor_outdoor',
-    message: 'Will the event be indoor or outdoor?',
-    field: 'indoor_outdoor',
-    type: 'buttons',
-    options: [
-      { id: 'Indoor', title: 'Indoor' },
-      { id: 'Outdoor', title: 'Outdoor' },
-      { id: 'Both', title: 'Both' }
-    ]
-  },
-  {
-    id: 'theme',
-    message: 'Do you have a theme or concept? Reply *skip* if none.',
-    field: 'theme',
-    type: 'text',
-    required: false
-  },
-  {
-    id: 'event_objectives',
-    message: 'What are the main objectives of this event?',
-    field: 'event_objectives',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'target_audience',
-    message: 'Who is the target audience?',
-    field: 'target_audience',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'services_required',
-    message: 'Which services do you need?',
-    field: 'services_required',
-    type: 'services'
-  },
-  {
-    id: 'has_budget',
-    message: 'Do you have an estimated budget?',
-    field: 'has_budget',
-    type: 'buttons',
-    options: [
-      { id: 'Yes', title: 'Yes' },
-      { id: 'No', title: 'No' },
-      { id: 'Not sure', title: 'Not sure' }
-    ]
-  },
-  {
-    id: 'budget_range',
-    message: 'What is your estimated budget range?',
-    field: 'budget_range',
-    type: 'list',
-    options: BUDGET_RANGES.map((t) => ({ id: t, title: t.slice(0, 24) })),
-    skipIf: (data) => data.has_budget !== 'Yes'
-  },
-  {
-    id: 'quotation_needed_by',
-    message: 'When do you need the quotation?',
-    field: 'quotation_needed_by',
-    type: 'text',
-    required: true
-  },
-  {
-    id: 'is_urgent',
-    message: 'Is this enquiry urgent?',
-    field: 'is_urgent',
-    type: 'buttons',
-    options: [
-      { id: 'Yes', title: 'Yes' },
-      { id: 'No', title: 'No' }
-    ]
-  },
-  {
-    id: 'decision_deadline',
-    message: 'When is your decision deadline? Reply *skip* if none.',
-    field: 'decision_deadline',
-    type: 'text',
-    required: false
-  },
-  {
-    id: 'supporting_documents',
-    message:
-      'You can send supporting documents now (event brief, floor plans, mood boards, brand guidelines, etc.).\n\nSend files here, or reply *skip* / *done* to continue.',
-    field: 'documents',
-    type: 'upload'
-  },
-  {
-    id: 'additional_requirements',
-    message: "Is there anything else you'd like us to know about your event? Reply *skip* if none.",
-    field: 'additional_requirements',
-    type: 'text',
-    required: false
-  },
-  {
-    id: 'consent_contact',
-    message: 'Do you agree to be contacted about this enquiry?',
-    field: 'consent_contact',
-    type: 'buttons',
-    options: [
-      { id: 'Yes', title: 'Yes, I agree' },
-      { id: 'No', title: 'No' }
-    ]
-  },
-  {
-    id: 'consent_marketing',
-    message: 'May we send proposals and marketing communications?',
-    field: 'consent_marketing',
-    type: 'buttons',
-    options: [
-      { id: 'Yes', title: 'Yes, I agree' },
-      { id: 'No', title: 'Proposals only' }
-    ]
-  }
-];
 
-const STEP_INDEX = Object.fromEntries(STEPS.map((s, i) => [s.id, i]));
+  // ── Buy a House ──────────────────────────────────────────
+  buy: {
+    message: () =>
+      `You're exploring <strong>home ownership</strong> with BHC.\n\nWhat would you like to know?`,
+    options: [
+      { id: "buy_view", label: "View available properties" },
+      { id: "buy_pricing", label: "Pricing" },
+      { id: "buy_eligibility", label: "Eligibility" },
+      { id: "buy_docs", label: "Required documents" },
+      { id: "buy_viewing", label: "Book viewing" },
+      NAV.MAIN,
+    ],
+  },
+  buy_view: {
+    message: () =>
+      `<strong>Available properties</strong>\n\nCurrent BHC sale listings include:\n\n• <strong>Phakalane Estate</strong> — 3-bed units from P685,000\n• <strong>Block 8, Gaborone</strong> — 2-bed flats from P420,000\n• <strong>Francistown Extension 14</strong> — 3-bed houses from P510,000\n• <strong>Palapye</strong> — starter homes from P295,000\n\nListings update regularly. Visit <strong>bhc.bw</strong> or a branch for the full catalogue.`,
+    options: [
+      { id: "buy_viewing", label: "Book a viewing", primary: true },
+      { id: "buy_pricing", label: "See pricing" },
+      { id: "buy", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+  buy_pricing: {
+    message: () =>
+      `<strong>Pricing overview</strong>\n\nBHC sale prices vary by location, size, and finishing:\n\n• Starter / 1–2 bed — from <strong>P250,000</strong>\n• Family / 3-bed — from <strong>P450,000</strong>\n• Premium estates — from <strong>P650,000+</strong>\n\nA 10% deposit is typically required. Payment plans and bank financing options are available for eligible buyers.`,
+    options: [
+      { id: "buy_eligibility", label: "Check eligibility" },
+      { id: "buy", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+  buy_eligibility: {
+    message: () =>
+      `<strong>Buyer eligibility</strong>\n\nTo purchase a BHC house you generally need to:\n\n• Be a Botswana citizen or permanent resident\n• Be 18 years or older\n• Provide proof of income / financing\n• Not already own a BHC-subsidised property (where subsidy rules apply)\n\nFinal eligibility is confirmed during application review.`,
+    options: [
+      { id: "buy_docs", label: "Required documents" },
+      { id: "buy", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+  buy_docs: {
+    message: () =>
+      `<strong>Required documents</strong>\n\nPlease prepare:\n\n1. Certified copy of Omang / passport\n2. Proof of income (payslips or bank statements)\n3. Marriage certificate / affidavit (if applicable)\n4. Proof of residence\n5. Bank pre-approval letter (recommended)\n\nBring originals and certified copies to your nearest BHC office.`,
+    options: [
+      { id: "buy_viewing", label: "Book a viewing", primary: true },
+      { id: "buy", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+  buy_viewing: {
+    message: () =>
+      `<strong>Book a property viewing</strong>\n\nShare your details and preferred property. A BHC officer will confirm your appointment.`,
+    form: "viewing",
+    options: [{ id: "buy", label: NAV.BACK.label }, NAV.MAIN],
+  },
 
-function getStep(id) {
-  return STEPS.find((s) => s.id === id);
-}
+  // ── Rent a Property ──────────────────────────────────────
+  rent: {
+    message: () =>
+      `Looking to <strong>rent</strong> with BHC?\n\nChoose an option below.`,
+    options: [
+      { id: "rent_available", label: "Available rentals" },
+      { id: "rent_rates", label: "Rental rates" },
+      { id: "rent_apply", label: "Apply" },
+      { id: "rent_lease", label: "Lease enquiries" },
+      NAV.MAIN,
+    ],
+  },
+  rent_available: {
+    message: () =>
+      `<strong>Available rentals</strong>\n\nUnits currently open for application:\n\n• <strong>Gaborone — Broadhurst</strong> — 2-bed flat\n• <strong>Gaborone — Extension 9</strong> — 3-bed house\n• <strong>Lobatse</strong> — 2-bed unit\n• <strong>Maun</strong> — 3-bed house\n• <strong>Selebi-Phikwe</strong> — 1-bed flat\n\nAvailability changes quickly — apply early or visit a branch.`,
+    options: [
+      { id: "rent_apply", label: "Apply now", primary: true },
+      { id: "rent_rates", label: "Rental rates" },
+      { id: "rent", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+  rent_rates: {
+    message: () =>
+      `<strong>Rental rates</strong>\n\nIndicative monthly rents:\n\n• Bedsitter / 1-bed — <strong>P1,200 – P2,500</strong>\n• 2-bed — <strong>P2,500 – P4,500</strong>\n• 3-bed — <strong>P4,000 – P7,500</strong>\n\nRates depend on location, condition, and unit type. A security deposit (usually one month’s rent) is required.`,
+    options: [
+      { id: "rent_apply", label: "Start application" },
+      { id: "rent", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+  rent_apply: {
+    message: () =>
+      `<strong>Rental application</strong>\n\nComplete the form and we’ll log your application. You’ll receive a reference number for follow-up.`,
+    form: "rent_apply",
+    options: [{ id: "rent", label: NAV.BACK.label }, NAV.MAIN],
+  },
+  rent_lease: {
+    message: () =>
+      `<strong>Lease enquiries</strong>\n\nStandard BHC residential leases:\n\n• Initial term: <strong>12 months</strong>\n• Renewable subject to good standing\n• Notice period: <strong>1 calendar month</strong>\n• Subletting is not permitted without written approval\n• Rent is due on or before the 1st of each month\n\nFor a specific lease query, speak to Customer Care or visit your branch.`,
+    options: [
+      { id: "care", label: "Speak to Customer Care", primary: true },
+      { id: "rent", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
 
-function nextStepId(currentId, data) {
-  let i = STEP_INDEX[currentId] + 1;
-  while (i < STEPS.length) {
-    const step = STEPS[i];
-    if (step.skipIf && step.skipIf(data)) {
-      i += 1;
-      continue;
-    }
-    return step.id;
-  }
-  return 'complete';
-}
+  // ── Maintenance ──────────────────────────────────────────
+  maintenance: {
+    message: () =>
+      `<strong>Maintenance support</strong>\n\nHow can we assist with your property?`,
+    options: [
+      { id: "maint_report", label: "Report issue" },
+      { id: "maint_emergency", label: "Emergency repair" },
+      { id: "maint_track", label: "Track maintenance request" },
+      { id: "maint_faq", label: "Maintenance FAQs" },
+      NAV.MAIN,
+    ],
+  },
+  maint_report: {
+    message: () =>
+      `<strong>Report a maintenance issue</strong>\n\nDescribe the problem and your unit details. Non-urgent requests are usually acknowledged within 1–2 working days.`,
+    form: "maint_report",
+    options: [{ id: "maintenance", label: NAV.BACK.label }, NAV.MAIN],
+  },
+  maint_emergency: {
+    message: () =>
+      `<strong>Emergency repair</strong>\n\nFor urgent issues that threaten safety or cause major damage (burst pipe, electrical hazard, no access, structural risk):\n\n• Call the emergency line: <strong>0800 600 700</strong> (toll-free demo)\n• Or submit below and mark as emergency\n\nPlease only use this for true emergencies.`,
+    form: "maint_emergency",
+    options: [{ id: "maintenance", label: NAV.BACK.label }, NAV.MAIN],
+  },
+  maint_track: {
+    message: () =>
+      `<strong>Track a maintenance request</strong>\n\nEnter your request reference number (e.g. MNT-2026-00482).`,
+    form: "maint_track",
+    options: [{ id: "maintenance", label: NAV.BACK.label }, NAV.MAIN],
+  },
+  maint_faq: {
+    message: () =>
+      `<strong>Maintenance FAQs</strong>\n\n<strong>Who is responsible for repairs?</strong>\nBHC handles structural and common-area repairs. Tenants handle day-to-day care and damage caused by misuse.\n\n<strong>How long do repairs take?</strong>\nEmergencies: within 24 hours. Routine: 5–14 working days depending on parts and priority.\n\n<strong>Can I hire my own contractor?</strong>\nOnly with prior written approval from BHC.\n\n<strong>Will I be charged?</strong>\nTenant-caused damage may be billed to your account.`,
+    options: [
+      { id: "maint_report", label: "Report an issue", primary: true },
+      { id: "maintenance", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
 
-// ─── WhatsApp Cloud API ─────────────────────────────────────────────────────
+  // ── Payments ─────────────────────────────────────────────
+  payments: {
+    message: () =>
+      `<strong>Payments</strong>\n\nManage rent, balances, and confirmations.`,
+    options: [
+      { id: "pay_balance", label: "Rental balance" },
+      { id: "pay_methods", label: "Payment methods" },
+      { id: "pay_statements", label: "Statements" },
+      { id: "pay_confirm", label: "Payment confirmation" },
+      NAV.MAIN,
+    ],
+  },
+  pay_balance: {
+    message: () =>
+      `<strong>Rental balance enquiry</strong>\n\nEnter your tenant / account number to look up your balance. (Demo returns a sample balance.)`,
+    form: "pay_balance",
+    options: [{ id: "payments", label: NAV.BACK.label }, NAV.MAIN],
+  },
+  pay_methods: {
+    message: () =>
+      `<strong>Payment methods</strong>\n\nYou can pay BHC via:\n\n• <strong>Bank deposit / EFT</strong> — use your account number as reference\n• <strong>Orange Money / MyZaka / Smega</strong>\n• <strong>Point of sale</strong> at BHC cashier desks\n• <strong>Debit order</strong> (arrange at your branch)\n\nAlways keep your proof of payment.`,
+    options: [
+      { id: "pay_confirm", label: "Submit payment confirmation" },
+      { id: "payments", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+  pay_statements: {
+    message: () =>
+      `<strong>Account statements</strong>\n\nRequest a statement for your rental or purchase account. Statements are emailed within 1 working day (demo).`,
+    form: "pay_statements",
+    options: [{ id: "payments", label: NAV.BACK.label }, NAV.MAIN],
+  },
+  pay_confirm: {
+    message: () =>
+      `<strong>Payment confirmation</strong>\n\nAlready paid? Upload the details so we can allocate your payment.`,
+    form: "pay_confirm",
+    options: [{ id: "payments", label: NAV.BACK.label }, NAV.MAIN],
+  },
 
-async function waPost(payload) {
-  if (!whatsappToken || !phoneNumberId) {
-    console.error(
-      '❌ Cannot send WhatsApp reply: set WHATSAPP_TOKEN (or ACCESS_TOKEN) and PHONE_NUMBER_ID on Render.'
-    );
-    console.log('[DEV] Would send:', JSON.stringify(payload, null, 2));
-    return { error: { message: 'Missing WHATSAPP_TOKEN or PHONE_NUMBER_ID' } };
-  }
-  const url = `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${whatsappToken}`,
-        'Content-Type': 'application/json'
+  // ── Office Information ───────────────────────────────────
+  office: {
+    message: () =>
+      `<strong>Office information</strong>\n\nFind a branch, hours, contacts, or directions.`,
+    options: [
+      { id: "office_branches", label: "Branches" },
+      { id: "office_hours", label: "Working hours" },
+      { id: "office_contacts", label: "Contacts" },
+      { id: "office_directions", label: "Directions" },
+      NAV.MAIN,
+    ],
+  },
+  office_branches: {
+    message: () =>
+      `<strong>BHC branches</strong>\n\n• <strong>Head Office — Gaborone</strong>\n  Plot 5129, Corner Machel Drive &amp; Station Road\n• <strong>Francistown</strong> — Blue Jacket Street\n• <strong>Maun</strong> — Tsheko Tsheko Road\n• <strong>Palapye</strong> — Central Business District\n• <strong>Lobatse</strong> — Woodhall Industrial\n• <strong>Selebi-Phikwe</strong> — The Mall\n\nVisit any branch for applications, payments, and enquiries.`,
+    options: [
+      { id: "office_directions", label: "Get directions" },
+      { id: "office_hours", label: "Working hours" },
+      { id: "office", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+  office_hours: {
+    message: () =>
+      `<strong>Working hours</strong>\n\n• Monday – Friday: <strong>07:30 – 16:30</strong>\n• Lunch: 12:45 – 14:00 (cashier may pause)\n• Saturday, Sunday &amp; public holidays: <strong>Closed</strong>\n\nEmergency maintenance remains available after hours via the emergency line.`,
+    options: [
+      { id: "office_contacts", label: "Contacts" },
+      { id: "office", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+  office_contacts: {
+    message: () =>
+      `<strong>Contacts</strong>\n\n• Switchboard: <strong>+267 360 5100</strong>\n• Customer Care: <strong>+267 360 5200</strong>\n• Email: <strong>customercare@bhc.bw</strong>\n• Emergency (demo): <strong>0800 600 700</strong>\n• Website: <strong>www.bhc.bw</strong>`,
+    options: [
+      { id: "care", label: "Speak to Customer Care", primary: true },
+      { id: "office", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+  office_directions: {
+    message: () =>
+      `<strong>Directions</strong>\n\n<strong>Gaborone Head Office</strong>\nPlot 5129, corner of Machel Drive and Station Road — near the CBD / railway area.\n\n<strong>Francistown</strong>\nBlue Jacket Street, central business district.\n\nFor GPS / map links, search “Botswana Housing Corporation” on Google Maps, or ask the attendant at reception when you arrive.`,
+    options: [
+      { id: "office_branches", label: "All branches" },
+      { id: "office", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+
+  // ── Customer Care ────────────────────────────────────────
+  care: {
+    message: () =>
+      `<strong>Customer Care</strong>\n\nWe’re here to help. How would you like to connect?`,
+    options: [
+      { id: "care_live", label: "Live Agent" },
+      { id: "care_callback", label: "Call Back" },
+      { id: "care_ticket", label: "Create Support Ticket" },
+      NAV.MAIN,
+    ],
+  },
+  care_live: {
+    message: () =>
+      `<strong>Live Agent</strong>\n\nConnecting you to a Customer Care agent…\n\n<em>Demo mode:</em> agents are available Mon–Fri, 07:30–16:30. Outside these hours, please request a call back or create a support ticket.\n\nEstimated wait: <strong>~3 minutes</strong> during business hours.`,
+    options: [
+      { id: "care_callback", label: "Request call back instead" },
+      { id: "care_ticket", label: "Create support ticket" },
+      { id: "care", label: NAV.BACK.label },
+      NAV.MAIN,
+    ],
+  },
+  care_callback: {
+    message: () =>
+      `<strong>Request a call back</strong>\n\nLeave your number and preferred time. An officer will return your call.`,
+    form: "callback",
+    options: [{ id: "care", label: NAV.BACK.label }, NAV.MAIN],
+  },
+  care_ticket: {
+    message: () =>
+      `<strong>Create a support ticket</strong>\n\nDescribe your issue and we’ll open a ticket for follow-up.`,
+    form: "ticket",
+    options: [{ id: "care", label: NAV.BACK.label }, NAV.MAIN],
+  },
+};
+
+const FORMS = {
+  viewing: {
+    fields: [
+      { name: "name", label: "Full name", type: "text", required: true },
+      { name: "phone", label: "Phone number", type: "tel", required: true },
+      { name: "property", label: "Property / area of interest", type: "text", required: true },
+      {
+        name: "date",
+        label: "Preferred date",
+        type: "date",
+        required: true,
       },
-      body: JSON.stringify(payload)
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      console.error('❌ WhatsApp API error:', res.status, JSON.stringify(data, null, 2));
-    } else {
-      console.log('✅ Sent', payload.type, 'to', payload.to);
-    }
-    return data;
-  } catch (err) {
-    console.error('❌ WhatsApp send failed:', err.message);
-    return { error: { message: err.message } };
-  }
+    ],
+    submitLabel: "Book viewing",
+    success: (d) =>
+      `Thank you, <strong>${escapeHtml(d.name)}</strong>. Your viewing request for <strong>${escapeHtml(d.property)}</strong> on <strong>${escapeHtml(d.date)}</strong> has been logged.\n\nReference: <strong>VW-${ref()}</strong>\n\nWe’ll confirm on <strong>${escapeHtml(d.phone)}</strong>.`,
+  },
+  rent_apply: {
+    fields: [
+      { name: "name", label: "Full name", type: "text", required: true },
+      { name: "phone", label: "Phone number", type: "tel", required: true },
+      { name: "omang", label: "Omang / ID number", type: "text", required: true },
+      {
+        name: "location",
+        label: "Preferred location",
+        type: "select",
+        options: ["Gaborone", "Francistown", "Maun", "Palapye", "Lobatse", "Selebi-Phikwe", "Other"],
+        required: true,
+      },
+      {
+        name: "beds",
+        label: "Bedrooms needed",
+        type: "select",
+        options: ["1", "2", "3", "4+"],
+        required: true,
+      },
+    ],
+    submitLabel: "Submit application",
+    success: (d) =>
+      `Application received for <strong>${escapeHtml(d.name)}</strong>.\n\nLocation: <strong>${escapeHtml(d.location)}</strong> · ${escapeHtml(d.beds)} bedroom(s)\nReference: <strong>RA-${ref()}</strong>\n\nA housing officer will contact you on <strong>${escapeHtml(d.phone)}</strong>.`,
+  },
+  maint_report: {
+    fields: [
+      { name: "account", label: "Tenant / unit number", type: "text", required: true },
+      { name: "phone", label: "Phone number", type: "tel", required: true },
+      {
+        name: "category",
+        label: "Issue category",
+        type: "select",
+        options: ["Plumbing", "Electrical", "Doors / locks", "Roof / leaks", "Painting", "Other"],
+        required: true,
+      },
+      { name: "details", label: "Describe the issue", type: "textarea", required: true },
+    ],
+    submitLabel: "Submit request",
+    success: (d) =>
+      `Maintenance request logged.\n\nCategory: <strong>${escapeHtml(d.category)}</strong>\nUnit: <strong>${escapeHtml(d.account)}</strong>\nReference: <strong>MNT-${ref()}</strong>\n\nWe’ll update you on <strong>${escapeHtml(d.phone)}</strong>.`,
+  },
+  maint_emergency: {
+    fields: [
+      { name: "account", label: "Tenant / unit number", type: "text", required: true },
+      { name: "phone", label: "Phone number", type: "tel", required: true },
+      { name: "details", label: "Describe the emergency", type: "textarea", required: true },
+    ],
+    submitLabel: "Report emergency",
+    success: (d) =>
+      `<strong>Emergency request received</strong>\n\nUnit: <strong>${escapeHtml(d.account)}</strong>\nReference: <strong>EMG-${ref()}</strong>\n\nA technician will be dispatched. Keep your phone (<strong>${escapeHtml(d.phone)}</strong>) available.\n\nIf life or property is in immediate danger, also call <strong>999 / 911</strong>.`,
+  },
+  maint_track: {
+    fields: [
+      { name: "ref", label: "Request reference", type: "text", required: true, placeholder: "MNT-2026-00482" },
+    ],
+    submitLabel: "Track request",
+    success: (d) => {
+      const statuses = ["Received", "Assigned to technician", "Parts ordered", "In progress", "Completed"];
+      const status = statuses[Math.abs(hash(d.ref)) % statuses.length];
+      return `Reference <strong>${escapeHtml(d.ref)}</strong>\n\nStatus: <strong>${status}</strong>\nLast update: today\n\nFor more detail, call Customer Care with this reference.`;
+    },
+  },
+  pay_balance: {
+    fields: [
+      { name: "account", label: "Tenant / account number", type: "text", required: true },
+    ],
+    submitLabel: "Check balance",
+    success: (d) => {
+      const bal = ((Math.abs(hash(d.account)) % 8500) + 350).toLocaleString("en-BW");
+      return `Account <strong>${escapeHtml(d.account)}</strong>\n\nOutstanding balance: <strong>P${bal}</strong>\nDue date: 1st of next month\n\n<em>Demo figures only — confirm at a branch or on your statement.</em>`;
+    },
+  },
+  pay_statements: {
+    fields: [
+      { name: "account", label: "Tenant / account number", type: "text", required: true },
+      { name: "email", label: "Email address", type: "email", required: true },
+    ],
+    submitLabel: "Request statement",
+    success: (d) =>
+      `Statement request logged for account <strong>${escapeHtml(d.account)}</strong>.\n\nIt will be sent to <strong>${escapeHtml(d.email)}</strong>.\nReference: <strong>ST-${ref()}</strong>`,
+  },
+  pay_confirm: {
+    fields: [
+      { name: "account", label: "Tenant / account number", type: "text", required: true },
+      { name: "amount", label: "Amount paid (P)", type: "text", required: true },
+      { name: "date", label: "Payment date", type: "date", required: true },
+      { name: "ref", label: "Bank / mobile money reference", type: "text", required: true },
+    ],
+    submitLabel: "Submit confirmation",
+    success: (d) =>
+      `Payment confirmation received.\n\nAccount: <strong>${escapeHtml(d.account)}</strong>\nAmount: <strong>P${escapeHtml(d.amount)}</strong>\nYour ref: <strong>${escapeHtml(d.ref)}</strong>\nBHC ref: <strong>PC-${ref()}</strong>\n\nAllocation usually completes within 1–2 working days.`,
+  },
+  callback: {
+    fields: [
+      { name: "name", label: "Full name", type: "text", required: true },
+      { name: "phone", label: "Phone number", type: "tel", required: true },
+      {
+        name: "time",
+        label: "Preferred call time",
+        type: "select",
+        options: ["Morning (08:00–12:00)", "Afternoon (14:00–16:30)", "Anytime during office hours"],
+        required: true,
+      },
+      { name: "reason", label: "Reason for call (optional)", type: "textarea", required: false },
+    ],
+    submitLabel: "Request call back",
+    success: (d) =>
+      `Call-back scheduled for <strong>${escapeHtml(d.name)}</strong>.\n\nWe’ll call <strong>${escapeHtml(d.phone)}</strong> — preferred: <strong>${escapeHtml(d.time)}</strong>\nReference: <strong>CB-${ref()}</strong>`,
+  },
+  ticket: {
+    fields: [
+      { name: "name", label: "Full name", type: "text", required: true },
+      { name: "phone", label: "Phone number", type: "tel", required: true },
+      { name: "email", label: "Email (optional)", type: "email", required: false },
+      {
+        name: "topic",
+        label: "Topic",
+        type: "select",
+        options: ["Buying", "Renting", "Maintenance", "Payments", "Lease", "Other"],
+        required: true,
+      },
+      { name: "details", label: "Describe your issue", type: "textarea", required: true },
+    ],
+    submitLabel: "Create ticket",
+    success: (d) =>
+      `Support ticket created.\n\nTopic: <strong>${escapeHtml(d.topic)}</strong>\nTicket: <strong>TKT-${ref()}</strong>\n\nWe’ll follow up with <strong>${escapeHtml(d.name)}</strong> on <strong>${escapeHtml(d.phone)}</strong>.`,
+  },
+};
+
+let history = [];
+let busy = false;
+
+function escapeHtml(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
-async function sendText(to, body) {
-  return waPost({
-    messaging_product: 'whatsapp',
-    to: String(to).replace(/\D/g, ''), // digits only
-    type: 'text',
-    text: { preview_url: false, body: String(body).slice(0, 4096) }
+function ref() {
+  return String(Date.now()).slice(-8);
+}
+
+function hash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+  return h;
+}
+
+function scrollChat() {
+  requestAnimationFrame(() => {
+    chatEl.scrollTop = chatEl.scrollHeight;
   });
 }
 
-async function sendButtons(to, body, options) {
-  const payload = {
-    messaging_product: 'whatsapp',
-    to: String(to).replace(/\D/g, ''),
-    type: 'interactive',
-    interactive: {
-      type: 'button',
-      body: { text: String(body).slice(0, 1024) },
-      action: {
-        buttons: options.slice(0, 3).map((o) => ({
-          type: 'reply',
-          reply: { id: String(o.id).slice(0, 256), title: String(o.title).slice(0, 20) }
-        }))
-      }
+function addBubble(role, html) {
+  const wrap = document.createElement("div");
+  wrap.className = `msg ${role}`;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.innerHTML = html;
+  wrap.appendChild(bubble);
+  chatEl.appendChild(wrap);
+  scrollChat();
+  return wrap;
+}
+
+function showTyping() {
+  const el = document.createElement("div");
+  el.className = "typing";
+  el.id = "typing";
+  el.innerHTML = "<span></span><span></span><span></span>";
+  el.setAttribute("aria-label", "Assistant is typing");
+  chatEl.appendChild(el);
+  scrollChat();
+}
+
+function hideTyping() {
+  document.getElementById("typing")?.remove();
+}
+
+function clearQuick() {
+  quickEl.innerHTML = "";
+}
+
+function renderOptions(options) {
+  clearQuick();
+  inputForm.hidden = true;
+
+  (options || []).forEach((opt) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "chip";
+    if (opt.id === NAV.MAIN.id || opt.label?.startsWith("←")) btn.classList.add("nav");
+    if (opt.primary) btn.classList.add("primary");
+    btn.textContent = opt.label;
+    btn.addEventListener("click", () => onSelect(opt.id, opt.label));
+    quickEl.appendChild(btn);
+  });
+}
+
+function renderForm(formKey, nodeId) {
+  const def = FORMS[formKey];
+  if (!def) return;
+
+  const lastBot = chatEl.querySelector(".msg.bot:last-of-type .bubble");
+  if (!lastBot) return;
+
+  const card = document.createElement("form");
+  card.className = "form-card";
+  card.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(card).entries());
+    card.remove();
+    clearQuick();
+    addBubble("user", `Submitted ${def.submitLabel.toLowerCase()}`);
+    respondWithHtml(def.success(data), [
+      { id: parentOf(nodeId) || "welcome", label: NAV.BACK.label },
+      NAV.MAIN,
+    ]);
+  });
+
+  def.fields.forEach((f) => {
+    const label = document.createElement("label");
+    label.textContent = f.label;
+
+    let input;
+    if (f.type === "textarea") {
+      input = document.createElement("textarea");
+    } else if (f.type === "select") {
+      input = document.createElement("select");
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "Select…";
+      placeholder.disabled = true;
+      placeholder.selected = true;
+      input.appendChild(placeholder);
+      f.options.forEach((o) => {
+        const opt = document.createElement("option");
+        opt.value = o;
+        opt.textContent = o;
+        input.appendChild(opt);
+      });
+    } else {
+      input = document.createElement("input");
+      input.type = f.type;
     }
+
+    input.name = f.name;
+    if (f.required) input.required = true;
+    if (f.placeholder) input.placeholder = f.placeholder;
+    label.appendChild(input);
+    card.appendChild(label);
+  });
+
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.textContent = def.submitLabel;
+  card.appendChild(submit);
+  lastBot.appendChild(card);
+  scrollChat();
+}
+
+function parentOf(nodeId) {
+  const map = {
+    buy_view: "buy",
+    buy_pricing: "buy",
+    buy_eligibility: "buy",
+    buy_docs: "buy",
+    buy_viewing: "buy",
+    rent_available: "rent",
+    rent_rates: "rent",
+    rent_apply: "rent",
+    rent_lease: "rent",
+    maint_report: "maintenance",
+    maint_emergency: "maintenance",
+    maint_track: "maintenance",
+    maint_faq: "maintenance",
+    pay_balance: "payments",
+    pay_methods: "payments",
+    pay_statements: "payments",
+    pay_confirm: "payments",
+    office_branches: "office",
+    office_hours: "office",
+    office_contacts: "office",
+    office_directions: "office",
+    care_live: "care",
+    care_callback: "care",
+    care_ticket: "care",
   };
-  const result = await waPost(payload);
-  if (result?.error) {
-    const lines = options.map((o, i) => `${i + 1}. ${o.title}`).join('\n');
-    return sendText(to, `${body}\n\n${lines}\n\nReply with the option text or number.`);
-  }
-  return result;
+  return map[nodeId];
 }
 
-async function sendList(to, body, buttonLabel, options) {
-  const payload = {
-    messaging_product: 'whatsapp',
-    to: String(to).replace(/\D/g, ''),
-    type: 'interactive',
-    interactive: {
-      type: 'list',
-      body: { text: String(body).slice(0, 1024) },
-      action: {
-        button: String(buttonLabel || 'Select').slice(0, 20),
-        sections: [
-          {
-            title: 'Options',
-            rows: options.slice(0, 10).map((o) => ({
-              id: String(o.id).slice(0, 200),
-              title: String(o.title).slice(0, 24)
-            }))
-          }
-        ]
-      }
-    }
-  };
-  const result = await waPost(payload);
-  if (result?.error) {
-    const lines = options.map((o, i) => `${i + 1}. ${o.title}`).join('\n');
-    return sendText(to, `${body}\n\n${lines}\n\nReply with the option text or number.`);
-  }
-  return result;
+async function respondWithHtml(html, options, formKey, nodeId) {
+  busy = true;
+  clearQuick();
+  showTyping();
+  await wait(450 + Math.random() * 350);
+  hideTyping();
+  addBubble("bot", html);
+  if (formKey) renderForm(formKey, nodeId);
+  renderOptions(options);
+  busy = false;
 }
 
-async function markRead(messageId) {
-  if (!whatsappToken || !phoneNumberId || !messageId) return;
-  return waPost({
-    messaging_product: 'whatsapp',
-    status: 'read',
-    message_id: messageId
-  });
+function wait(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-async function promptStep(to, stepId) {
-  const step = getStep(stepId);
-  if (!step) return;
+async function goTo(nodeId, { silentUser } = {}) {
+  if (nodeId === NAV.MAIN.id) nodeId = "welcome";
 
-  if (step.type === 'services') {
-    const lines = SERVICES.map((s, i) => `${i + 1}. ${s}`).join('\n');
-    await sendText(
-      to,
-      `${step.message}\n\n${lines}\n\nReply with numbers separated by commas (e.g. *1,5,12*), then *done*.`
-    );
+  const node = TREE[nodeId];
+  if (!node) return;
+
+  history.push(nodeId);
+  await respondWithHtml(node.message(), node.options, node.form, nodeId);
+}
+
+async function onSelect(id, label) {
+  if (busy) return;
+
+  if (id === NAV.MAIN.id) {
+    addBubble("user", "Main menu");
+    await goTo("welcome");
     return;
   }
 
-  if (step.type === 'upload') {
-    await sendText(to, step.message);
-    return;
-  }
-
-  if (step.type === 'buttons' && step.options?.length) {
-    if (whatsappToken && phoneNumberId) {
-      await sendButtons(to, step.message, step.options);
-    } else {
-      await sendText(to, `${step.message}\n\n${step.options.map((o) => `• ${o.title}`).join('\n')}`);
-    }
-    return;
-  }
-
-  if (step.type === 'list' && step.options?.length) {
-    if (whatsappToken && phoneNumberId) {
-      await sendList(to, step.message, 'Choose', step.options);
-    } else {
-      await sendText(to, `${step.message}\n\n${step.options.map((o, i) => `${i + 1}. ${o.title}`).join('\n')}`);
-    }
-    return;
-  }
-
-  await sendText(to, step.message);
+  addBubble("user", label.replace(/^←\s*/, "") || label);
+  await goTo(id);
 }
 
-// ─── Sessions & enquiries ───────────────────────────────────────────────────
-
-function getSession(waId) {
-  return readJson(sessionsFile, {})[waId] || null;
+async function start() {
+  chatEl.innerHTML = "";
+  history = [];
+  clearQuick();
+  inputForm.hidden = true;
+  await goTo("welcome");
 }
 
-function saveSession(waId, session) {
-  const all = readJson(sessionsFile, {});
-  all[waId] = { ...session, updated_at: new Date().toISOString() };
-  writeJson(sessionsFile, all);
-}
-
-function resetSession(waId) {
-  const all = readJson(sessionsFile, {});
-  delete all[waId];
-  writeJson(sessionsFile, all);
-}
-
-function createSession(waId) {
-  const session = {
-    id: randomUUID(),
-    step: 'welcome',
-    data: { phone: waId, preferred_contact: 'WhatsApp', documents: [] },
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
-  };
-  saveSession(waId, session);
-  return session;
-}
-
-async function saveEnquiry(waId, data) {
-  const services = Array.isArray(data.services_required)
-    ? data.services_required.join(', ')
-    : data.services_required || '';
-
-  const result = await phpApi('POST', '/enquiries', {
-    body: {
-      wa_id: waId,
-      status: 'New',
-      full_name: data.full_name || '',
-      company: data.company || '',
-      email: data.email || '',
-      phone: data.phone || waId,
-      preferred_contact: data.preferred_contact || 'WhatsApp',
-      event_type: data.event_type || '',
-      event_name: data.event_name || '',
-      event_date: data.event_date || '',
-      alternative_date: data.alternative_date || '',
-      event_start_time: data.event_start_time || '',
-      event_end_time: data.event_end_time || '',
-      venue: data.venue || '',
-      venue_confirmed: data.venue_confirmed || '',
-      expected_guests: data.expected_guests || '',
-      vip_guests: data.vip_guests || '',
-      indoor_outdoor: data.indoor_outdoor || '',
-      theme: data.theme || '',
-      event_objectives: data.event_objectives || '',
-      target_audience: data.target_audience || '',
-      services_required: services,
-      has_budget: data.has_budget || '',
-      budget_range: data.budget_range || '',
-      quotation_needed_by: data.quotation_needed_by || '',
-      is_urgent: data.is_urgent || '',
-      decision_deadline: data.decision_deadline || '',
-      additional_requirements: data.additional_requirements || '',
-      documents: data.documents || [],
-      consent_contact: data.consent_contact || '',
-      consent_marketing: data.consent_marketing || '',
-      created_message: 'Enquiry submitted via WhatsApp'
-    }
-  });
-
-  if (!result.ok) {
-    const detail = result.payload && result.payload.error ? result.payload.error : `HTTP ${result.status}`;
-    throw new Error(`Failed to save enquiry to PHP API: ${detail}`);
-  }
-
-  const enquiry = result.payload;
-  notifyNewEnquiry(enquiry).catch((err) => console.error('Email notify failed:', err.message));
-  return enquiry;
-}
-
-async function notifyNewEnquiry(enquiry) {
-  const to = process.env.NOTIFY_EMAIL;
-  if (!to || !process.env.SMTP_HOST) {
-    console.log('New enquiry saved:', enquiry.id, enquiry.event_name);
-    return;
-  }
-  const nodemailer = require('nodemailer');
-  const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: parseInt(process.env.SMTP_PORT || '587', 10),
-    secure: process.env.SMTP_SECURE === 'true',
-    auth: process.env.SMTP_USER
-      ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-      : undefined
-  });
-  const appUrl = dashboardUrl || process.env.APP_URL || '';
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to,
-    subject: `[New Enquiry] ${enquiry.event_name} — ${enquiry.full_name}`,
-    text: [
-      'New Native Events enquiry',
-      `Client: ${enquiry.full_name} (${enquiry.company})`,
-      `Email: ${enquiry.email}`,
-      `Phone: ${enquiry.phone}`,
-      `Event: ${enquiry.event_name} (${enquiry.event_type})`,
-      `Date: ${enquiry.event_date}`,
-      `Venue: ${enquiry.venue}`,
-      `Guests: ${enquiry.expected_guests}`,
-      `Budget: ${enquiry.budget_range || enquiry.has_budget}`,
-      `Services: ${enquiry.services_required}`,
-      `Urgent: ${enquiry.is_urgent}`,
-      appUrl ? `Dashboard: ${appUrl}` : ''
-    ].join('\n')
-  });
-}
-
-// ─── Conversation handler ───────────────────────────────────────────────────
-
-function extractInput(message) {
-  if (message.type === 'text') return { kind: 'text', value: message.text?.body?.trim() || '' };
-  if (message.type === 'interactive') {
-    const i = message.interactive;
-    if (i?.type === 'button_reply') return { kind: 'text', value: i.button_reply?.id || i.button_reply?.title || '' };
-    if (i?.type === 'list_reply') return { kind: 'text', value: i.list_reply?.id || i.list_reply?.title || '' };
-  }
-  if (message.type === 'button') return { kind: 'text', value: message.button?.payload || message.button?.text || '' };
-  if (message.type === 'document' || message.type === 'image') {
-    return {
-      kind: 'media',
-      value: {
-        type: message.type,
-        id: message.document?.id || message.image?.id,
-        name: message.document?.filename || 'image.jpg'
-      }
-    };
-  }
-  return null;
-}
-
-function resolveOption(value, options) {
-  if (!options?.length) return value;
-  const match = options.find((o) => o.id === value || o.title === value);
-  if (match) return match.id;
-  const n = parseInt(value, 10);
-  if (!Number.isNaN(n) && n >= 1 && n <= options.length) return options[n - 1].id;
-  const lower = value.toLowerCase();
-  const soft = options.find((o) => o.id.toLowerCase() === lower || o.title.toLowerCase() === lower);
-  return soft ? soft.id : value;
-}
-
-function parseServices(value) {
-  return value
-    .split(/[,;\s]+/)
-    .map((p) => p.trim())
-    .filter(Boolean)
-    .map((part) => {
-      const n = parseInt(part, 10);
-      if (!Number.isNaN(n) && n >= 1 && n <= SERVICES.length) return SERVICES[n - 1];
-      return SERVICES.find((s) => s.toLowerCase() === part.toLowerCase()) || null;
-    })
-    .filter(Boolean);
-}
-
-async function handleMessage(from, message) {
-  const input = extractInput(message);
-  if (!input) {
-    await sendText(from, 'Please reply with text, or use the buttons/list when shown.');
-    return;
-  }
-
-  const text = input.kind === 'text' ? input.value : '';
-  const isRestart = /^(hi|hello|hey|start|menu|restart)$/i.test(text);
-
-  let session = getSession(from);
-
-  // "Get started" button id used to be "start", which matched isRestart and
-  // re-showed welcome forever. Still treat start/get_started on welcome as continue.
-  const advancingWelcome =
-    session?.step === 'welcome' && /^(start|get[_ ]?started|continue)$/i.test(text);
-
-  if ((isRestart || !session || session.step === 'complete') && !advancingWelcome) {
-    if (session?.step === 'complete' && !isRestart) {
-      await sendText(from, 'Your enquiry is already submitted. Reply *start* to begin a new one.');
-      return;
-    }
-    resetSession(from);
-    session = createSession(from);
-    await promptStep(from, 'welcome');
-    return;
-  }
-
-  const step = getStep(session.step);
-  if (!step) {
-    session.step = 'welcome';
-    saveSession(from, session);
-    await promptStep(from, 'welcome');
-    return;
-  }
-
-  const data = { ...session.data };
-
-  // Documents
-  if (step.type === 'upload') {
-    if (input.kind === 'media') {
-      data.documents = data.documents || [];
-      data.documents.push(input.value);
-      session.data = data;
-      saveSession(from, session);
-      await sendText(from, `Received (${data.documents.length}). Send more, or reply *done* / *skip*.`);
-      return;
-    }
-    if (!/^(skip|done|continue)$/i.test(text)) {
-      await sendText(from, 'Please send a file, or reply *skip* / *done* to continue.');
-      return;
-    }
-  }
-
-  // Services multi-select
-  if (step.type === 'services') {
-    if (/^(done|skip)$/i.test(text)) {
-      if (!(data.services_required || []).length) {
-        await sendText(from, 'Please select at least one service number first (e.g. *1,5,12*).');
-        return;
-      }
-    } else {
-      const picked = parseServices(text);
-      if (!picked.length) {
-        await sendText(from, 'Reply with numbers like *1,5,12*, then *done*.');
-        return;
-      }
-      data.services_required = [...new Set([...(data.services_required || []), ...picked])];
-      session.data = data;
-      saveSession(from, session);
-      await sendText(
-        from,
-        `Added. Selected: ${data.services_required.join(', ')}\n\nAdd more numbers, or reply *done*.`
-      );
-      return;
-    }
-  }
-
-  // Normal answer
-  let value = text;
-
-  if (step.type === 'buttons' || step.type === 'list') {
-    value = resolveOption(value, step.options);
-  }
-
-  if (step.id === 'phone' && /^(same|this|whatsapp)$/i.test(value)) {
-    value = from.startsWith('+') ? from : `+${from}`;
-  }
-
-  if (step.type === 'upload') {
-    value = data.documents || [];
-  }
-
-  if (step.type === 'services') {
-    value = data.services_required;
-  }
-
-  if (step.field && step.type === 'text') {
-    if (!step.required && /^skip$/i.test(value)) {
-      value = '';
-    } else if (step.required && !value.trim()) {
-      await sendText(from, 'This is required — please reply with your answer.');
-      return;
-    } else if (step.validate) {
-      const err = step.validate(value);
-      if (err) {
-        await sendText(from, err);
-        return;
-      }
-    }
-  }
-
-  if (step.field && step.type !== 'upload') {
-    data[step.field] = value;
-  }
-  if (step.field === 'documents') {
-    data.documents = Array.isArray(value) ? value : data.documents || [];
-  }
-  if (step.type === 'services') {
-    data.services_required = value;
-  }
-
-  const next = nextStepId(step.id, data);
-
-  if (next === 'complete') {
-    let enquiry;
-    try {
-      enquiry = await saveEnquiry(from, data);
-    } catch (err) {
-      console.error('saveEnquiry failed:', err.message);
-      await sendText(
-        from,
-        'Sorry — we could not save your enquiry right now. Please try again in a moment or reply *start* to begin again.'
-      );
-      return;
-    }
-    session.step = 'complete';
-    session.data = data;
-    session.enquiry_id = enquiry.id;
-    saveSession(from, session);
-
-    await sendText(
-      from,
-      `Thank you! Your enquiry has been submitted successfully.\n\nOur sales team will review your event brief and prepare a tailored quotation. We'll be in touch shortly.\n\n*Reference:* ${enquiry.id.slice(0, 8).toUpperCase()}\n\nReply *start* anytime for a new enquiry.`
-    );
-    return;
-  }
-
-  session.step = next;
-  session.data = data;
-  saveSession(from, session);
-  await promptStep(from, next);
-}
-
-// ─── Webhook (same pattern as before) ───────────────────────────────────────
-
-app.get('/', (req, res) => {
-  const { 'hub.mode': mode, 'hub.challenge': challenge, 'hub.verify_token': token } = req.query;
-
-  if (mode === 'subscribe' && token === verifyToken) {
-    console.log('WEBHOOK VERIFIED');
-    res.status(200).send(challenge);
-  } else if (!mode) {
-    res.status(200).send('Native Events WhatsApp Enquiry Bot is running. CRM dashboard is hosted on cPanel (PHP).');
-  } else {
-    res.status(403).end();
-  }
+restartBtn.addEventListener("click", () => {
+  if (busy) return;
+  start();
 });
 
-app.post('/', async (req, res) => {
-  // Always ACK immediately so Meta does not retry
-  res.status(200).end();
-
-  const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  console.log(`\nWebhook received ${timestamp}`);
-  console.log(JSON.stringify(req.body, null, 2));
-
-  try {
-    const body = req.body || {};
-    if (body.object !== 'whatsapp_business_account') {
-      console.log('Ignoring non-WhatsApp payload');
-      return;
-    }
-
-    for (const entry of body.entry || []) {
-      for (const change of entry.changes || []) {
-        const value = change.value;
-        // Status updates (delivered/read) — ignore
-        if (!value?.messages?.length) {
-          if (value?.statuses) console.log('Status update (ignored)');
-          continue;
-        }
-
-        for (const message of value.messages) {
-          const from = message.from;
-          console.log(`Incoming from ${from} type=${message.type}`);
-          try {
-            await markRead(message.id);
-          } catch (_) {}
-          try {
-            await handleMessage(from, message);
-          } catch (err) {
-            console.error('handleMessage error:', err);
-            await sendText(from, 'Sorry, something went wrong. Please reply *start* to try again.').catch(() => {});
-          }
-        }
-      }
-    }
-  } catch (err) {
-    console.error('Webhook error:', err);
-  }
+inputForm.addEventListener("submit", (e) => {
+  e.preventDefault();
 });
 
-app.get('/health', (_req, res) => {
-  res.json({
-    ok: true,
-    verifyTokenSet: Boolean(verifyToken),
-    whatsappTokenSet: Boolean(whatsappToken),
-    phoneNumberIdSet: Boolean(phoneNumberId),
-    phoneNumberIdPreview: phoneNumberId ? `${String(phoneNumberId).slice(0, 4)}…` : null,
-    apiVersion
-  });
-});
-
-// Start
-app.listen(port, () => {
-  console.log(`\nNative Events WhatsApp chatbot listening on port ${port}`);
-  console.log('Webhook: GET/POST /');
-  console.log('Health:  GET /health');
-  console.log('CRM:     hosted on cPanel (PHP) — not this service\n');
-  console.log('Config check:');
-  console.log('  VERIFY_TOKEN:     ', verifyToken ? '✓ set' : '✗ MISSING');
-  console.log('  WHATSAPP_TOKEN:   ', whatsappToken ? '✓ set' : '✗ MISSING');
-  console.log('  PHONE_NUMBER_ID:  ', phoneNumberId ? '✓ set' : '✗ MISSING');
-  console.log('  DATA_DIR:         ', dataDir);
-  console.log('  PHP_API_URL:      ', phpApiEndpoint);
-  console.log('  PHP_API_KEY:      ', phpApiKey ? '✓ set' : '✗ MISSING');
-  console.log('  DASHBOARD_URL:    ', dashboardUrl || '○ optional');
-});
+start();
