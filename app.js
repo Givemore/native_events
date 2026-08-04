@@ -64,6 +64,45 @@ const NAV = {
   BACK: { id: '__back__', title: 'Back' }
 };
 
+/** House sale brochure PDF — sent as a WhatsApp document attachment (not a text link). */
+const HOUSE_BROCHURE = {
+  link: 'https://www.bhc.bw/api/storage/files/media-resources/01c603c8-267c-497f-b5f9-3c15fe5431a6.pdf',
+  filename: 'BHC-House-Sale-Brochure-Batch-53.pdf',
+  caption:
+    '*BHC House Sale Brochure (Batch 53)*\n\nOpen this PDF to browse houses currently offered for sale. Tap the document above to view or download.'
+};
+
+/**
+ * Featured sale listings with photos.
+ * Images are public HTTPS URLs WhatsApp can fetch and show inline.
+ */
+const SALE_PROPERTIES = [
+  {
+    title: 'Phakalane Estate',
+    detail: '3-bed units from P685,000',
+    image:
+      'https://bhc-storage-prod.s3.af-south-1.amazonaws.com/hero-images/fa73c0bd-4cb9-436b-97f2-91d54de802a2.jpg'
+  },
+  {
+    title: 'Block 8, Gaborone',
+    detail: '2-bed flats from P420,000',
+    image:
+      'https://images.pexels.com/photos/323780/pexels-photo-323780.jpeg?auto=compress&cs=tinysrgb&w=800'
+  },
+  {
+    title: 'Francistown Extension 14',
+    detail: '3-bed houses from P510,000',
+    image:
+      'https://bhc-storage-prod.s3.af-south-1.amazonaws.com/hero-images/2595850a-7bef-4cf0-bc6b-a7b122c2cb8b.jpg'
+  },
+  {
+    title: 'Palapye',
+    detail: 'Starter homes from P295,000',
+    image:
+      'https://www.bhc.bw/api/storage/files/newsImages/9fa32bad-1eb4-45b2-921a-3462e2d28dfe.jpg'
+  }
+];
+
 /** Conversation tree — mirrors the BHC flowchart (WhatsApp-safe text) */
 const TREE = {
   welcome: {
@@ -84,6 +123,7 @@ const TREE = {
     message: "You're exploring *home ownership* with BHC.\n\nWhat would you like to know?",
     options: [
       { id: 'buy_view', title: 'Available properties' },
+      { id: 'buy_brochure', title: 'House brochure PDF' },
       { id: 'buy_pricing', title: 'Pricing' },
       { id: 'buy_eligibility', title: 'Eligibility' },
       { id: 'buy_docs', title: 'Required documents' },
@@ -93,10 +133,26 @@ const TREE = {
   },
   buy_view: {
     message:
-      '*Available properties*\n\nCurrent BHC sale listings include:\n\n• *Phakalane Estate* — 3-bed units from P685,000\n• *Block 8, Gaborone* — 2-bed flats from P420,000\n• *Francistown Extension 14* — 3-bed houses from P510,000\n• *Palapye* — starter homes from P295,000\n\nListings update regularly. Visit *bhc.bw* or a branch for the full catalogue.',
+      '*Available properties*\n\nWe’ve sent photos of featured homes plus the *house sale brochure PDF* above — tap the document to open it.\n\nCurrent BHC sale listings include:\n\n• *Phakalane Estate* — 3-bed units from P685,000\n• *Block 8, Gaborone* — 2-bed flats from P420,000\n• *Francistown Extension 14* — 3-bed houses from P510,000\n• *Palapye* — starter homes from P295,000\n\nListings update regularly. Visit a BHC branch for the full catalogue.',
+    images: SALE_PROPERTIES.map((p) => ({
+      link: p.image,
+      caption: `*${p.title}*\n${p.detail}`
+    })),
+    document: HOUSE_BROCHURE,
     options: [
       { id: 'buy_viewing', title: 'Book a viewing' },
       { id: 'buy_pricing', title: 'See pricing' },
+      { id: 'buy', title: 'Back' },
+      NAV.MAIN
+    ]
+  },
+  buy_brochure: {
+    message:
+      '*House sale brochure*\n\nThe PDF is attached above. Open it to view BHC houses offered for sale (Batch 53).\n\nNeed help choosing a home? Browse photos under *Available properties* or book a viewing.',
+    document: HOUSE_BROCHURE,
+    options: [
+      { id: 'buy_view', title: 'Available properties' },
+      { id: 'buy_viewing', title: 'Book a viewing' },
       { id: 'buy', title: 'Back' },
       NAV.MAIN
     ]
@@ -496,6 +552,7 @@ const FORMS = {
 
 const PARENT = {
   buy_view: 'buy',
+  buy_brochure: 'buy',
   buy_pricing: 'buy',
   buy_eligibility: 'buy',
   buy_docs: 'buy',
@@ -561,6 +618,41 @@ async function sendText(to, body) {
     type: 'text',
     text: { preview_url: false, body: String(body).slice(0, 4096) }
   });
+}
+
+/** Send a PDF/file as a WhatsApp document attachment (customer can open in-app). */
+async function sendDocument(to, link, filename, caption) {
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: String(to).replace(/\D/g, ''),
+    type: 'document',
+    document: {
+      link: String(link),
+      filename: String(filename || 'document.pdf').slice(0, 240)
+    }
+  };
+  if (caption) payload.document.caption = String(caption).slice(0, 1024);
+  const result = await waPost(payload);
+  if (result?.error) {
+    // Fallback so the customer still gets access if media fetch fails
+    await sendText(
+      to,
+      `${caption || 'Document'}\n\nDownload: ${link}`
+    );
+  }
+  return result;
+}
+
+/** Send a property photo with caption. */
+async function sendImage(to, link, caption) {
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: String(to).replace(/\D/g, ''),
+    type: 'image',
+    image: { link: String(link) }
+  };
+  if (caption) payload.image.caption = String(caption).slice(0, 1024);
+  return waPost(payload);
 }
 
 async function sendButtons(to, body, options) {
@@ -654,6 +746,23 @@ async function promptNode(to, nodeId) {
   if (node.form) {
     await sendText(to, node.message);
     return;
+  }
+
+  // Property photos first so the chat looks like a catalogue
+  if (node.images?.length) {
+    for (const img of node.images) {
+      await sendImage(to, img.link, img.caption);
+    }
+  }
+
+  // Brochure / PDF as a real document attachment (openable in WhatsApp)
+  if (node.document?.link) {
+    await sendDocument(
+      to,
+      node.document.link,
+      node.document.filename,
+      node.document.caption
+    );
   }
 
   await promptOptions(to, node.message, node.options);
