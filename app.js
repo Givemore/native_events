@@ -12,6 +12,8 @@
  *   PORT               — set by Render
  *   DATA_DIR           — session storage (e.g. /var/data on Render)
  *   WHATSAPP_API_VERSION — optional, default v21.0
+ *   DASHBOARD_API_URL  — e.g. https://paakanyo.co.bw/bhc-chat/api.php
+ *   DASHBOARD_API_KEY  — same secret as dashboard config api_key
  */
 const express = require('express');
 const fs = require('fs');
@@ -26,6 +28,10 @@ const verifyToken = process.env.VERIFY_TOKEN;
 const whatsappToken = process.env.WHATSAPP_TOKEN || process.env.ACCESS_TOKEN;
 const phoneNumberId = process.env.PHONE_NUMBER_ID;
 const apiVersion = process.env.WHATSAPP_API_VERSION || 'v21.0';
+
+/** Remote PHP dashboard sync (paakanyo.co.bw) — optional; bot still writes locally. */
+const dashboardApiUrl = (process.env.DASHBOARD_API_URL || '').replace(/\/$/, '');
+const dashboardApiKey = process.env.DASHBOARD_API_KEY || '';
 
 const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
 const sessionsFile = path.join(dataDir, 'sessions.json');
@@ -791,6 +797,41 @@ async function promptFormField(to, formKey, fieldIndex) {
   await sendText(to, field.message);
 }
 
+// ─── Dashboard sync (Render → paakanyo.co.bw) ───────────────────────────────
+
+async function syncDashboard(payload) {
+  if (!dashboardApiUrl || !dashboardApiKey) return;
+  try {
+    const res = await fetch(dashboardApiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${dashboardApiKey}`,
+        'X-Api-Key': dashboardApiKey
+      },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.error('❌ Dashboard sync failed:', res.status, text.slice(0, 300));
+    }
+  } catch (err) {
+    console.error('❌ Dashboard sync error:', err.message || err);
+  }
+}
+
+function syncSession(waId, session) {
+  void syncDashboard({ action: 'upsert_session', wa_id: waId, session });
+}
+
+function syncDeleteSession(waId) {
+  void syncDashboard({ action: 'delete_session', wa_id: waId });
+}
+
+function syncSubmission(submission) {
+  void syncDashboard({ action: 'add_submission', submission });
+}
+
 // ─── Sessions ───────────────────────────────────────────────────────────────
 
 function getSession(waId) {
@@ -799,14 +840,17 @@ function getSession(waId) {
 
 function saveSession(waId, session) {
   const all = readJson(sessionsFile, {});
-  all[waId] = { ...session, updated_at: new Date().toISOString() };
+  const next = { ...session, updated_at: new Date().toISOString() };
+  all[waId] = next;
   writeJson(sessionsFile, all);
+  syncSession(waId, next);
 }
 
 function resetSession(waId) {
   const all = readJson(sessionsFile, {});
   delete all[waId];
   writeJson(sessionsFile, all);
+  syncDeleteSession(waId);
 }
 
 function createSession(waId) {
@@ -836,6 +880,7 @@ function logSubmission(waId, formKey, data) {
   };
   all.push(entry);
   writeJson(submissionsFile, all);
+  syncSubmission(entry);
   console.log('Submission saved:', entry.id, formKey);
   return entry;
 }
@@ -1119,7 +1164,9 @@ app.get('/health', (_req, res) => {
     whatsappTokenSet: Boolean(whatsappToken),
     phoneNumberIdSet: Boolean(phoneNumberId),
     phoneNumberIdPreview: phoneNumberId ? `${String(phoneNumberId).slice(0, 4)}…` : null,
-    apiVersion
+    apiVersion,
+    dashboardSync: Boolean(dashboardApiUrl && dashboardApiKey),
+    dashboardApiUrl: dashboardApiUrl || null
   });
 });
 
@@ -1132,4 +1179,8 @@ app.listen(port, () => {
   console.log('  WHATSAPP_TOKEN:   ', whatsappToken ? '✓ set' : '✗ MISSING');
   console.log('  PHONE_NUMBER_ID:  ', phoneNumberId ? '✓ set' : '✗ MISSING');
   console.log('  DATA_DIR:         ', dataDir);
+  console.log(
+    '  DASHBOARD_API:    ',
+    dashboardApiUrl && dashboardApiKey ? `✓ ${dashboardApiUrl}` : '✗ not set (local data only)'
+  );
 });
