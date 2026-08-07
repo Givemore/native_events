@@ -34,11 +34,7 @@ const sampleSeconds = Math.min(
 );
 
 const ACTION_HUM = 'action_hum';
-const ACTION_LISTEN = 'action_listen';
 const ACTION_DETECT_AGAIN = 'action_detect_again';
-
-/** Last matched song links per WhatsApp user (for Listen picker). */
-const lastMatchByUser = new Map();
 
 // Botswana stations — button titles must be ≤ 20 chars (WhatsApp limit)
 const STATIONS = {
@@ -154,16 +150,11 @@ async function sendImage(to, imageUrl, caption = '') {
 }
 
 /** Upload a ~10s stream snap and send it as a playable WhatsApp audio message. */
-async function sendStreamClip(to, audioBuffer, stationTitle) {
+async function sendStreamClip(to, audioBuffer) {
   const mediaId = await uploadWhatsAppMedia(
     audioBuffer,
     'audio/mpeg',
     'stream-clip.mp3'
-  );
-  await sendText(
-    to,
-    `*${stationTitle}* — here’s ~${sampleSeconds}s of what’s on air:`,
-    { previewUrl: false }
   );
   return sendAudio(to, mediaId, { voice: false });
 }
@@ -849,7 +840,7 @@ async function identifyViaPhp(streamUrl) {
   }
 }
 
-/** Prefer https links WhatsApp can open; drop intent:// and other app schemes. */
+/** Prefer https image/cover URLs WhatsApp can fetch. */
 function cleanHttpUrl(raw) {
   if (!raw || typeof raw !== 'string') return null;
   const value = raw.trim();
@@ -860,16 +851,6 @@ function cleanHttpUrl(raw) {
     if (path) return `https://${path}`;
   }
 
-  if (value.startsWith('spotify:track:')) {
-    const id = value.slice('spotify:track:'.length).split('?')[0];
-    return id ? `https://open.spotify.com/track/${id}` : null;
-  }
-
-  if (value.startsWith('spotify:search:')) {
-    // Handled later with a readable + query — don't emit %20 junk here.
-    return value;
-  }
-
   if (value.startsWith('https://') || value.startsWith('http://')) {
     return value;
   }
@@ -877,116 +858,7 @@ function cleanHttpUrl(raw) {
   return null;
 }
 
-function shortenYoutubeUrl(url) {
-  try {
-    const u = new URL(url);
-    if (!/youtu\.?be|youtube\.com/i.test(u.hostname)) return url;
-    const id =
-      u.searchParams.get('v') ||
-      (u.hostname.includes('youtu.be') ? u.pathname.split('/').filter(Boolean)[0] : null);
-    return id ? `https://youtu.be/${id}` : url;
-  } catch (_) {
-    return url;
-  }
-}
-
-/** Readable search query for URLs (avoid %20 / %26 walls of text). */
-function plusQuery(...parts) {
-  return parts
-    .filter(Boolean)
-    .join(' ')
-    .trim()
-    .replace(/&/g, 'and')
-    .replace(/\s+/g, '+');
-}
-
-/** Trim tracking noise; keep search links readable. */
-function tidyListenUrl(url) {
-  try {
-    if (url.startsWith('spotify:search:')) {
-      return null; // resolved in songListenLinks
-    }
-    const u = new URL(url);
-    if (/apple\.com|itunes\.apple\.com/i.test(u.hostname)) {
-      u.search = '';
-      u.hash = '';
-      return u.toString();
-    }
-    if (/open\.spotify\.com\/track\//i.test(u.href)) {
-      u.search = '';
-      u.hash = '';
-      return u.toString();
-    }
-    if (/open\.spotify\.com\/search\//i.test(u.href)) {
-      const q = decodeURIComponent(u.pathname.replace(/^\/search\//, '')).replace(/\+/g, ' ');
-      const clean = plusQuery(q);
-      return clean ? `https://open.spotify.com/search/${clean}` : url;
-    }
-    if (/youtube\.com\/results/i.test(u.href)) {
-      const q = u.searchParams.get('search_query') || '';
-      const clean = plusQuery(q);
-      return clean
-        ? `https://www.youtube.com/results?search_query=${clean}`
-        : url;
-    }
-    return shortenYoutubeUrl(url);
-  } catch (_) {
-    return url;
-  }
-}
-
-function isDirectTrackUrl(url) {
-  if (!url) return false;
-  return (
-    /open\.spotify\.com\/track\//i.test(url) ||
-    /youtu\.be\/|youtube\.com\/watch/i.test(url) ||
-    /music\.apple\.com\//i.test(url)
-  );
-}
-
-/** Compact listen links — prefer real track URLs; searchable fallbacks stay short. */
-function songListenLinks(song) {
-  const links = [];
-
-  let apple = cleanHttpUrl(song.apple_music_url);
-  if (apple) apple = tidyListenUrl(apple) || apple;
-
-  let spotify = cleanHttpUrl(song.spotify_url);
-  if (typeof song.spotify_url === 'string' && song.spotify_url.startsWith('spotify:search:')) {
-    spotify = null;
-  } else if (spotify) {
-    spotify = tidyListenUrl(spotify) || spotify;
-  }
-  if (!isDirectTrackUrl(spotify)) {
-    const q = plusQuery(song.title, song.artist);
-    spotify = q ? `https://open.spotify.com/search/${q}` : null;
-  }
-
-  let youtube = cleanHttpUrl(song.youtube_url);
-  if (youtube) youtube = tidyListenUrl(youtube) || youtube;
-  if (!isDirectTrackUrl(youtube)) {
-    const q = plusQuery(song.artist, song.title);
-    youtube = q ? `https://www.youtube.com/results?search_query=${q}` : null;
-  }
-
-  // Stable order matching the Listen picker
-  if (spotify) links.push({ id: 'listen_spotify', label: 'Spotify', url: spotify });
-  if (apple) links.push({ id: 'listen_apple', label: 'Apple Music', url: apple });
-  if (youtube) links.push({ id: 'listen_youtube', label: 'YouTube', url: youtube });
-  return links;
-}
-
-function rememberMatch(to, stationTitle, song) {
-  lastMatchByUser.set(to, {
-    stationTitle,
-    title: song.title || '',
-    artist: song.artist || '',
-    links: songListenLinks(song),
-    detectedAt: Date.now(),
-  });
-}
-
-/** Labeled card style (Title / Artist / Album / Genre) — no raw URLs. */
+/** Labeled card — no links; nudge users to search on their preferred app. */
 function formatSongCard(stationTitle, song) {
   const lines = [
     `*${stationTitle}*`,
@@ -996,6 +868,12 @@ function formatSongCard(stationTitle, song) {
   ];
   if (song.album) lines.push(`*Album:* ${song.album}`);
   if (song.genres?.length) lines.push(`*Genre:* ${song.genres.join(', ')}`);
+
+  lines.push(
+    '',
+    `*You can now search this song on your preferred platform* — Spotify, Apple Music, YouTube, and more.`
+  );
+
   return lines.join('\n');
 }
 
@@ -1023,10 +901,6 @@ async function sendResultActions(to) {
         buttons: [
           {
             type: 'reply',
-            reply: { id: ACTION_LISTEN, title: '🎧 Listen' },
-          },
-          {
-            type: 'reply',
             reply: { id: ACTION_DETECT_AGAIN, title: '🔄 Detect Again' },
           },
         ],
@@ -1035,72 +909,7 @@ async function sendResultActions(to) {
   });
 }
 
-async function sendListenPicker(to) {
-  const match = lastMatchByUser.get(to);
-  if (!match?.links?.length) {
-    await sendText(
-      to,
-      'No recent song to open — detect a track first.',
-      { previewUrl: false }
-    );
-    await sendStationButtons(to);
-    return;
-  }
-
-  const numberEmojis = ['1️⃣', '2️⃣', '3️⃣'];
-  return sendWhatsApp({
-    to,
-    type: 'interactive',
-    interactive: {
-      type: 'list',
-      body: { text: 'Where would you like to listen?' },
-      action: {
-        button: 'Choose app',
-        sections: [
-          {
-            title: 'Listen on',
-            rows: match.links.map((link, index) => ({
-              id: link.id,
-              title: `${numberEmojis[index] || `${index + 1}.`} ${link.label}`.slice(
-                0,
-                24
-              ),
-              description: `Open in ${link.label}`.slice(0, 72),
-            })),
-          },
-        ],
-      },
-    },
-  });
-}
-
-async function sendOpenListenLink(to, link) {
-  const display = `Open ${link.label}`.slice(0, 20);
-  const body = await sendWhatsApp({
-    to,
-    type: 'interactive',
-    interactive: {
-      type: 'cta_url',
-      body: {
-        text: `Open *${link.label}* to play this track.`,
-      },
-      action: {
-        name: 'cta_url',
-        parameters: {
-          display_text: display,
-          url: link.url,
-        },
-      },
-    },
-  });
-
-  // Fallback if CTA isn’t available for this number
-  if (body?.error) {
-    await sendText(to, `${link.label}\n${link.url}`, { previewUrl: true });
-  }
-}
-
-async function sendSongResult(to, stationTitle, data) {
+async function sendSongResult(to, stationTitle, data, { audioClip = null } = {}) {
   const song = data.song || {};
 
   if (!song.matched) {
@@ -1108,11 +917,10 @@ async function sendSongResult(to, stationTitle, data) {
     return;
   }
 
-  rememberMatch(to, stationTitle, song);
   const card = formatSongCard(stationTitle, song);
   const cover = cleanHttpUrl(song.cover_art);
 
-  // Cover + labeled caption in one bubble (the style you liked)
+  // Cover + details in one bubble
   if (cover) {
     const body = await sendImage(to, cover, card);
     if (body?.error) {
@@ -1123,7 +931,22 @@ async function sendSongResult(to, stationTitle, data) {
     await sendText(to, card, { previewUrl: false });
   }
 
-  // Links open via Listen — keeps the card clean (no long URLs)
+  // Song sample from the live stream
+  if (Buffer.isBuffer(audioClip) && audioClip.length >= 500) {
+    try {
+      await sendStreamClip(to, audioClip);
+      await logUsage({
+        event: 'clip',
+        user_id: to,
+        phone: to,
+        station: stationTitle,
+        meta: { seconds: sampleSeconds, bytes: audioClip.length },
+      });
+    } catch (clipErr) {
+      console.warn('Stream clip send failed:', clipErr.message || clipErr);
+    }
+  }
+
   await sendResultActions(to);
 }
 
@@ -1229,6 +1052,16 @@ async function handleIdentify(to, station) {
     const data = await identifyStream(station.streamUrl);
     const song = data.song || {};
 
+    // Prefer the identify capture; otherwise grab a fresh ~10s sample for playback
+    let clip = Buffer.isBuffer(data.audio) ? data.audio : null;
+    if (!clip) {
+      try {
+        clip = await captureWithRetries(station.streamUrl, sampleSeconds, 2);
+      } catch (clipErr) {
+        console.warn('Stream clip capture failed:', clipErr.message || clipErr);
+      }
+    }
+
     await logUsage({
       event: 'identify',
       user_id: to,
@@ -1239,7 +1072,7 @@ async function handleIdentify(to, station) {
       artist: song.artist || '',
       genres: song.genres || [],
     });
-    await sendSongResult(to, station.title, data);
+    await sendSongResult(to, station.title, data, { audioClip: clip });
 
     if (!song.matched) {
       await sendStationButtons(to);
@@ -1347,29 +1180,8 @@ async function handleMessage(msg) {
     return;
   }
 
-  if (msg.buttonId === ACTION_LISTEN) {
-    await sendListenPicker(msg.from);
-    return;
-  }
-
   if (msg.buttonId === ACTION_DETECT_AGAIN) {
     await sendStationButtons(msg.from, msg.name);
-    return;
-  }
-
-  if (msg.buttonId.startsWith('listen_')) {
-    const match = lastMatchByUser.get(msg.from);
-    const link = match?.links?.find((l) => l.id === msg.buttonId);
-    if (link) {
-      await sendOpenListenLink(msg.from, link);
-    } else {
-      await sendText(
-        msg.from,
-        'That listen link expired — detect the song again.',
-        { previewUrl: false }
-      );
-      await sendStationButtons(msg.from, msg.name);
-    }
     return;
   }
 
