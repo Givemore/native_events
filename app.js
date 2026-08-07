@@ -102,7 +102,7 @@ async function sendStationButtons(to, name) {
       body: {
         text:
           `${greeting}What’s this song?\n\n` +
-          `• Pick a radio station to hear what’s playing now\n` +
+          `• Pick a radio station to detect what’s playing\n` +
           `• Or hum / detect a song from a voice note`,
       },
       action: {
