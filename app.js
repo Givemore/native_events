@@ -136,6 +136,18 @@ async function sendAudio(to, mediaId, { voice = false } = {}) {
   });
 }
 
+async function sendImage(to, imageUrl, caption = '') {
+  const image = { link: imageUrl };
+  if (caption) {
+    image.caption = String(caption).slice(0, 1024);
+  }
+  return sendWhatsApp({
+    to,
+    type: 'image',
+    image,
+  });
+}
+
 /** Upload a ~10s stream snap and send it as a playable WhatsApp audio message. */
 async function sendStreamClip(to, audioBuffer, stationTitle) {
   const mediaId = await uploadWhatsAppMedia(
@@ -515,29 +527,11 @@ function normalizeShazamResponse(data) {
   if (typeof appleUrl !== 'string') appleUrl = null;
 
   let youtubeUrl = hubProviderUrl(hub, 'youtube');
-  if (
-    !youtubeUrl &&
-    typeof track.url === 'string' &&
-    /youtu\.?be|youtube\.com/i.test(track.url)
-  ) {
-    youtubeUrl = track.url;
-  }
   for (const section of sections) {
-    if (String(section?.type || '').toUpperCase() !== 'VIDEO') continue;
     const yt = section?.youtubeurl?.actions?.[0]?.uri;
     if (typeof yt === 'string' && yt) {
       youtubeUrl = yt;
       break;
-    }
-  }
-  // Some payloads nest youtubeurl outside a typed VIDEO section
-  if (!youtubeUrl) {
-    for (const section of sections) {
-      const yt = section?.youtubeurl?.actions?.[0]?.uri;
-      if (typeof yt === 'string' && yt) {
-        youtubeUrl = yt;
-        break;
-      }
     }
   }
 
@@ -877,18 +871,13 @@ function tidyListenUrl(url) {
   }
 }
 
-/** Short listen links like the web — Shazam first so WhatsApp previews its compact card. */
+/** Short listen links like the web — Apple Music / Spotify / YouTube (never Shazam). */
 function songListenLinks(song) {
   const links = [];
-  const shazam = cleanHttpUrl(song.shazam_url);
   const apple = cleanHttpUrl(song.apple_music_url);
   const spotify = cleanHttpUrl(song.spotify_url);
   const youtube = cleanHttpUrl(song.youtube_url);
 
-  // Skip Shazam URL when it's actually a YouTube link (rare overlap)
-  if (shazam && !/youtu\.?be|youtube\.com/i.test(shazam)) {
-    links.push({ label: 'Shazam', url: tidyListenUrl(shazam) });
-  }
   if (apple) links.push({ label: 'Apple Music', url: tidyListenUrl(apple) });
   if (spotify) links.push({ label: 'Spotify', url: tidyListenUrl(spotify) });
   if (youtube) links.push({ label: 'YouTube', url: tidyListenUrl(youtube) });
@@ -918,8 +907,6 @@ function formatSongMessage(stationTitle, data) {
   const links = songListenLinks(song);
   if (links.length) {
     lines.push('');
-    // Put the primary (Shazam) URL first so WhatsApp builds one preview card
-    // with artwork — much smaller than a full image message.
     for (const { label, url } of links) {
       lines.push(`${label}\n${url}`);
     }
@@ -931,11 +918,23 @@ function formatSongMessage(stationTitle, data) {
 async function sendSongResult(to, stationTitle, data) {
   const song = data.song || {};
   const text = formatSongMessage(stationTitle, data);
-  const links = songListenLinks(song);
 
-  // WhatsApp always blows image messages up to full bubble width — skip that
-  // and let a listen-link preview show a compact card with artwork instead.
-  await sendText(to, text, { previewUrl: links.length > 0 });
+  if (!song.matched) {
+    await sendText(to, text, { previewUrl: false });
+    return;
+  }
+
+  const cover = cleanHttpUrl(song.cover_art);
+  if (cover) {
+    const body = await sendImage(to, cover, text);
+    // If WhatsApp rejects the remote image link, fall back to text.
+    if (!body?.error) return;
+    console.warn('Cover image send failed, falling back to text', body.error);
+  }
+
+  await sendText(to, text, {
+    previewUrl: songListenLinks(song).length > 0,
+  });
 }
 
 function formatHummingNoMatch() {
