@@ -323,6 +323,18 @@ app.get('/health', (_req, res) => {
 });
 
 // Capture proxy for cPanel/PHP (non-standard stream ports)
+app.get('/api/capture', (_req, res) => {
+  res.json({
+    ok: true,
+    method: 'POST',
+    usage: 'POST JSON { "stream_url": "http://...", "seconds": 10 }',
+    headers: captureProxySecret
+      ? { 'X-Capture-Secret': '(required — must match CAPTURE_PROXY_SECRET)' }
+      : {},
+    note: 'Used by moeng.io PHP when stream ports are blocked on shared hosting.',
+  });
+});
+
 app.post('/api/capture', async (req, res) => {
   if (captureProxySecret) {
     const provided = req.get('x-capture-secret') || '';
