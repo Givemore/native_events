@@ -10,6 +10,11 @@ const phoneNumberId = process.env.PHONE_NUMBER_ID;
 const identifyApiUrl =
   process.env.IDENTIFY_API_URL || 'https://moeng.io/mvumba/api/identify.php';
 const webAppUrl = process.env.WEB_APP_URL || 'https://moeng.io/mvumba/';
+const captureProxySecret = process.env.CAPTURE_PROXY_SECRET || '';
+const sampleSeconds = Math.min(
+  15,
+  Math.max(3, Number(process.env.SAMPLE_SECONDS) || 10)
+);
 
 // Botswana stations — button titles must be ≤ 20 chars (WhatsApp limit)
 const STATIONS = {
@@ -116,6 +121,73 @@ async function identifyStream(streamUrl) {
       throw new Error(data.error || `Identify failed (${response.status})`);
     }
     return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Capture ~N seconds of a live stream. Used by the PHP app on shared hosting
+ * that cannot open outbound connections to non-standard ports (Duma/Gabz).
+ */
+async function captureStreamAudio(streamUrl, seconds = sampleSeconds) {
+  const byteBudget = seconds * 20000;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), seconds * 1000 + 20000);
+
+  try {
+    const response = await fetch(streamUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; StreamShazam/1.0)',
+        'Icy-MetaData': '0',
+        Accept: 'audio/*,*/*',
+      },
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+
+    if (!response.ok && response.status !== 0) {
+      // Some shoutcast servers return odd statuses but still stream body
+      if (!response.body) {
+        throw new Error(`Stream HTTP ${response.status}`);
+      }
+    }
+
+    if (!response.body) {
+      throw new Error('Stream returned no body');
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let written = 0;
+
+    while (written < byteBudget) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.length === 0) continue;
+
+      const remaining = byteBudget - written;
+      if (value.length <= remaining) {
+        chunks.push(Buffer.from(value));
+        written += value.length;
+      } else {
+        chunks.push(Buffer.from(value.subarray(0, remaining)));
+        written += remaining;
+        break;
+      }
+    }
+
+    try {
+      await reader.cancel();
+    } catch (_) {
+      // ignore cancel errors
+    }
+
+    if (written < 2000) {
+      throw new Error(`Captured only ${written} bytes from stream`);
+    }
+
+    return Buffer.concat(chunks, written);
   } finally {
     clearTimeout(timeout);
   }
@@ -245,8 +317,57 @@ app.get('/health', (_req, res) => {
     ok: true,
     identifyApiUrl,
     webAppUrl,
+    captureEndpoint: '/api/capture',
     whatsappConfigured: Boolean(whatsappToken && phoneNumberId),
   });
+});
+
+// Capture proxy for cPanel/PHP (non-standard stream ports)
+app.post('/api/capture', async (req, res) => {
+  if (captureProxySecret) {
+    const provided = req.get('x-capture-secret') || '';
+    if (provided !== captureProxySecret) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+  }
+
+  const streamUrl = String(req.body?.stream_url || '').trim();
+  if (!streamUrl) {
+    return res.status(422).json({ ok: false, error: 'stream_url is required' });
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(streamUrl);
+  } catch (_) {
+    return res.status(422).json({ ok: false, error: 'Invalid stream_url' });
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    return res.status(422).json({ ok: false, error: 'Only http/https streams are supported' });
+  }
+
+  const seconds = Math.min(
+    15,
+    Math.max(3, Number(req.body?.seconds) || sampleSeconds)
+  );
+
+  try {
+    const audio = await captureStreamAudio(streamUrl, seconds);
+    res.set({
+      'Content-Type': 'audio/mpeg',
+      'Content-Length': String(audio.length),
+      'X-Capture-Bytes': String(audio.length),
+      'X-Capture-Seconds': String(seconds),
+    });
+    return res.status(200).send(audio);
+  } catch (err) {
+    console.error('Capture proxy failed', err);
+    return res.status(502).json({
+      ok: false,
+      error: err.message || 'Failed to capture stream',
+    });
+  }
 });
 
 // Incoming WhatsApp events — ACK immediately, process async
