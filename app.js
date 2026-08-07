@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const net = require('net');
 const tls = require('tls');
@@ -19,10 +20,16 @@ const rapidApiHost =
 const recognizeUrl =
   process.env.RECOGNIZE_URL ||
   'https://shazam-core.p.rapidapi.com/v1/tracks/recognize';
+const acrHost =
+  process.env.ACRCLOUD_HOST || 'identify-eu-west-1.acrcloud.com';
+const acrAccessKey = process.env.ACRCLOUD_ACCESS_KEY || '';
+const acrAccessSecret = process.env.ACRCLOUD_ACCESS_SECRET || '';
 const sampleSeconds = Math.min(
   15,
   Math.max(3, Number(process.env.SAMPLE_SECONDS) || 10)
 );
+
+const ACTION_HUM = 'action_hum';
 
 // Botswana stations — button titles must be ≤ 20 chars (WhatsApp limit)
 const STATIONS = {
@@ -91,22 +98,46 @@ async function sendStationButtons(to, name) {
     to,
     type: 'interactive',
     interactive: {
-      type: 'button',
+      type: 'list',
       body: {
         text:
-          `${greeting}Pick a Botswana station and I’ll identify what’s playing right now.`,
+          `${greeting}Pick a Botswana station, or hum / record a song as a voice note.`,
       },
       action: {
-        buttons: Object.values(STATIONS).map((station) => ({
-          type: 'reply',
-          reply: {
-            id: station.id,
-            title: station.title,
+        button: 'Choose option',
+        sections: [
+          {
+            title: 'Radio stations',
+            rows: Object.values(STATIONS).map((station) => ({
+              id: station.id,
+              title: station.title,
+              description: 'Identify what’s playing now',
+            })),
           },
-        })),
+          {
+            title: 'Humming',
+            rows: [
+              {
+                id: ACTION_HUM,
+                title: 'Hum a song',
+                description: 'Then send a voice note (10–15s)',
+              },
+            ],
+          },
+        ],
       },
     },
   });
+}
+
+async function sendHumInstructions(to) {
+  return sendText(
+    to,
+    '🎵 *Hum a song*\n\n' +
+      'Record a voice note humming or singing the melody for about *10–15 seconds*, then send it.\n\n' +
+      'Tip: hum clearly, one tune at a time — works best without background noise.',
+    { previewUrl: false }
+  );
 }
 
 function sleep(ms) {
@@ -402,6 +433,158 @@ async function recognizeWithShazam(audioBuffer) {
   }
 }
 
+function acrCloudConfigured() {
+  return Boolean(acrAccessKey && acrAccessSecret);
+}
+
+function normalizeAcrCloudResponse(data) {
+  const empty = {
+    matched: false,
+    title: null,
+    artist: null,
+    album: null,
+    genres: [],
+    shazam_url: null,
+    score: null,
+  };
+
+  if (!data || typeof data !== 'object') return empty;
+
+  const code = data.status?.code;
+  // 0 = success with results; 1001 = no result
+  if (code === 1001) return empty;
+  if (code != null && code !== 0) {
+    throw new Error(data.status?.msg || `ACRCloud status ${code}`);
+  }
+
+  const meta = data.metadata || {};
+  const candidates = []
+    .concat(Array.isArray(meta.humming) ? meta.humming : [])
+    .concat(Array.isArray(meta.music) ? meta.music : []);
+
+  if (!candidates.length) return empty;
+
+  const track = candidates[0];
+  const artists = Array.isArray(track.artists)
+    ? track.artists.map((a) => a?.name).filter(Boolean)
+    : [];
+  const genres = Array.isArray(track.genres)
+    ? track.genres.map((g) => g?.name).filter(Boolean)
+    : [];
+
+  const spotifyId = track.external_metadata?.spotify?.track?.id;
+  const youtubeId = track.external_metadata?.youtube?.vid;
+  let link = null;
+  if (spotifyId) link = `https://open.spotify.com/track/${spotifyId}`;
+  else if (youtubeId) link = `https://www.youtube.com/watch?v=${youtubeId}`;
+
+  return {
+    matched: true,
+    title: track.title || null,
+    artist: artists.join(', ') || null,
+    album: track.album?.name || null,
+    genres,
+    shazam_url: link,
+    score: typeof track.score === 'number' ? track.score : null,
+  };
+}
+
+async function recognizeWithAcrCloud(audioBuffer, filename = 'sample.ogg') {
+  if (!acrCloudConfigured()) {
+    throw new Error(
+      'ACRCloud is not configured. Set ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET.'
+    );
+  }
+
+  const endpoint = '/v1/identify';
+  const dataType = 'audio';
+  const signatureVersion = '1';
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const stringToSign = [
+    'POST',
+    endpoint,
+    acrAccessKey,
+    dataType,
+    signatureVersion,
+    timestamp,
+  ].join('\n');
+  const signature = crypto
+    .createHmac('sha1', acrAccessSecret)
+    .update(Buffer.from(stringToSign, 'utf-8'))
+    .digest('base64');
+
+  const form = new FormData();
+  form.append(
+    'sample',
+    new Blob([audioBuffer], { type: 'application/octet-stream' }),
+    filename
+  );
+  form.append('sample_bytes', String(audioBuffer.length));
+  form.append('access_key', acrAccessKey);
+  form.append('data_type', dataType);
+  form.append('signature_version', signatureVersion);
+  form.append('signature', signature);
+  form.append('timestamp', timestamp);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+
+  try {
+    const response = await fetch(`https://${acrHost}${endpoint}`, {
+      method: 'POST',
+      body: form,
+      signal: controller.signal,
+    });
+
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const message =
+        body.status?.msg || body.message || `ACRCloud HTTP ${response.status}`;
+      throw new Error(typeof message === 'string' ? message : JSON.stringify(message));
+    }
+
+    return normalizeAcrCloudResponse(body);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function downloadWhatsAppMedia(mediaId) {
+  if (!whatsappToken) {
+    throw new Error('WHATSAPP_TOKEN is not configured');
+  }
+
+  const metaResponse = await fetch(graphUrl(mediaId), {
+    headers: { Authorization: `Bearer ${whatsappToken}` },
+  });
+  const meta = await metaResponse.json().catch(() => ({}));
+  if (!metaResponse.ok || !meta.url) {
+    throw new Error(meta.error?.message || `Failed to resolve media ${mediaId}`);
+  }
+
+  const fileResponse = await fetch(meta.url, {
+    headers: { Authorization: `Bearer ${whatsappToken}` },
+  });
+  if (!fileResponse.ok) {
+    throw new Error(`Failed to download media (HTTP ${fileResponse.status})`);
+  }
+
+  const arrayBuffer = await fileResponse.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (buffer.length < 500) {
+    throw new Error(`Downloaded media too small (${buffer.length} bytes)`);
+  }
+
+  const mimeType = String(meta.mime_type || fileResponse.headers.get('content-type') || '');
+  let filename = 'sample.ogg';
+  if (mimeType.includes('mpeg') || mimeType.includes('mp3')) filename = 'sample.mp3';
+  else if (mimeType.includes('mp4') || mimeType.includes('m4a') || mimeType.includes('aac')) {
+    filename = 'sample.m4a';
+  } else if (mimeType.includes('wav')) filename = 'sample.wav';
+
+  return { buffer, filename, mimeType };
+}
+
 /** Prefer local capture+Shazam on Render (reliable). PHP path is fallback only. */
 async function identifyStream(streamUrl) {
   if (rapidApiKey) {
@@ -516,14 +699,22 @@ function formatSongMessage(stationTitle, data) {
 
   if (song.album) lines.push(`Album: ${song.album}`);
   if (song.genres?.length) lines.push(`Genre: ${song.genres.join(', ')}`);
+  if (typeof song.score === 'number') lines.push(`Confidence: ${song.score}%`);
 
-  // One clean Shazam link (WhatsApp shows a nice preview). Skip long/noisy extras.
+  // One clean link (WhatsApp shows a nice preview). Skip long/noisy extras.
   const shazam = cleanHttpUrl(song.shazam_url);
   if (shazam) {
     lines.push('', shazam);
   }
 
   return lines.join('\n');
+}
+
+function formatHummingNoMatch() {
+  return (
+    `🎵 *Humming*\n\n` +
+    `Couldn’t match that tune. Try again with a clearer 10–15s hum, or hum a more distinctive part of the melody.`
+  );
 }
 
 function isTechnicalError(err) {
@@ -550,6 +741,8 @@ function isTechnicalError(err) {
     'unauthorized',
     'ssl',
     'certificate',
+    'acrcloud',
+    'media',
   ];
   return technicalHints.some((hint) => msg.includes(hint));
 }
@@ -567,6 +760,29 @@ function formatIdentifyError(stationTitle, err) {
   return (
     `🎧 *${stationTitle}*\n\n` +
     `Sorry — I couldn’t identify what’s playing right now. Please try again shortly.`
+  );
+}
+
+function formatHummingError(err) {
+  console.error('Humming identify error', err);
+
+  if (!acrCloudConfigured()) {
+    return (
+      `🎵 *Humming*\n\n` +
+      `Humming isn’t set up yet on the server. Please try again later.`
+    );
+  }
+
+  if (isTechnicalError(err)) {
+    return (
+      `🎵 *Humming*\n\n` +
+      `We hit a technical error while identifying your voice note. Please try again in a moment.`
+    );
+  }
+
+  return (
+    `🎵 *Humming*\n\n` +
+    `Sorry — I couldn’t identify that tune. Please try again shortly.`
   );
 }
 
@@ -591,6 +807,40 @@ async function handleIdentify(to, station) {
   await sendStationButtons(to);
 }
 
+async function handleHummingAudio(to, mediaId) {
+  if (!acrCloudConfigured()) {
+    await sendText(to, formatHummingError(new Error('ACRCloud not configured')), {
+      previewUrl: false,
+    });
+    await sendStationButtons(to);
+    return;
+  }
+
+  await sendText(to, 'Listening to your voice note… usually a few seconds.');
+
+  try {
+    const media = await downloadWhatsAppMedia(mediaId);
+    const song = await recognizeWithAcrCloud(media.buffer, media.filename);
+    const data = {
+      ok: true,
+      matched: Boolean(song.matched),
+      song,
+    };
+
+    if (!song.matched) {
+      await sendText(to, formatHummingNoMatch(), { previewUrl: false });
+    } else {
+      await sendText(to, formatSongMessage('Humming', data), {
+        previewUrl: Boolean(song.shazam_url),
+      });
+    }
+  } catch (err) {
+    await sendText(to, formatHummingError(err), { previewUrl: false });
+  }
+
+  await sendStationButtons(to);
+}
+
 function extractIncomingMessages(body) {
   const messages = [];
   for (const entry of body.entry || []) {
@@ -607,6 +857,7 @@ function extractIncomingMessages(body) {
             message.interactive?.button_reply?.id ||
             message.interactive?.list_reply?.id ||
             '',
+          mediaId: message.audio?.id || message.voice?.id || '',
           name: contact?.profile?.name || '',
         });
       }
@@ -616,15 +867,36 @@ function extractIncomingMessages(body) {
 }
 
 async function handleMessage(msg) {
+  if (msg.buttonId === ACTION_HUM) {
+    await sendHumInstructions(msg.from);
+    return;
+  }
+
   const station = STATION_BY_ID[msg.buttonId];
   if (station) {
     await handleIdentify(msg.from, station);
     return;
   }
 
+  // Voice notes / audio clips → ACRCloud humming recognition
+  if ((msg.type === 'audio' || msg.type === 'voice') && msg.mediaId) {
+    await handleHummingAudio(msg.from, msg.mediaId);
+    return;
+  }
+
   // Any text (hi, help, identify, station name) → show clickable stations
   if (msg.type === 'text' || msg.type === 'button' || msg.type === 'interactive') {
     const lower = msg.text.toLowerCase();
+    if (
+      lower.includes('hum') ||
+      lower.includes('sing') ||
+      lower.includes('voice note') ||
+      lower.includes('record')
+    ) {
+      await sendHumInstructions(msg.from);
+      return;
+    }
+
     const named = Object.values(STATIONS).find(
       (s) =>
         lower.includes(s.title.toLowerCase()) ||
@@ -662,6 +934,8 @@ app.get('/health', (_req, res) => {
     captureEndpoint: '/api/capture',
     identifyMode: rapidApiKey ? 'render-local' : 'php-fallback',
     rapidapiConfigured: Boolean(rapidApiKey),
+    acrcloudConfigured: acrCloudConfigured(),
+    acrcloudHost: acrHost,
     whatsappConfigured: Boolean(whatsappToken && phoneNumberId),
   });
 });
@@ -746,6 +1020,9 @@ app.listen(port, () => {
   console.log(`StreamID WhatsApp bot listening on port ${port}`);
   console.log(
     `Identify mode: ${rapidApiKey ? 'render-local (capture+Shazam)' : 'php-fallback'}`
+  );
+  console.log(
+    `Humming (ACRCloud): ${acrCloudConfigured() ? `enabled @ ${acrHost}` : 'not configured'}`
   );
   console.log(`Identify API (fallback): ${identifyApiUrl}`);
 });
