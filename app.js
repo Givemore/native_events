@@ -136,6 +136,18 @@ async function sendAudio(to, mediaId, { voice = false } = {}) {
   });
 }
 
+async function sendImage(to, imageUrl, caption = '') {
+  const image = { link: imageUrl };
+  if (caption) {
+    image.caption = String(caption).slice(0, 1024);
+  }
+  return sendWhatsApp({
+    to,
+    type: 'image',
+    image,
+  });
+}
+
 /** Upload a ~10s stream snap and send it as a playable WhatsApp audio message. */
 async function sendStreamClip(to, audioBuffer, stationTitle) {
   const mediaId = await uploadWhatsAppMedia(
@@ -451,19 +463,47 @@ async function captureWithRetries(streamUrl, seconds = sampleSeconds, attempts =
   throw lastError || new Error('Failed to capture stream');
 }
 
-function normalizeShazamResponse(data) {
-  if (!data || typeof data !== 'object') {
-    return { matched: false, title: null, artist: null, album: null, genres: [], shazam_url: null };
-  }
+function emptySongResult() {
+  return {
+    matched: false,
+    title: null,
+    artist: null,
+    album: null,
+    genres: [],
+    cover_art: null,
+    shazam_url: null,
+    apple_music_url: null,
+    spotify_url: null,
+    youtube_url: null,
+    score: null,
+  };
+}
 
-  if (data.track == null && !data.title) {
-    return { matched: false, title: null, artist: null, album: null, genres: [], shazam_url: null };
+function hubProviderUrl(hub, providerType) {
+  const providers = Array.isArray(hub?.providers) ? hub.providers : [];
+  for (const provider of providers) {
+    if (String(provider?.type || '').toLowerCase() !== providerType) continue;
+    const actions = Array.isArray(provider.actions) ? provider.actions : [];
+    for (const action of actions) {
+      if (typeof action?.uri === 'string' && action.uri) return action.uri;
+    }
   }
+  return null;
+}
+
+function normalizeShazamResponse(data) {
+  if (!data || typeof data !== 'object') return emptySongResult();
+  if (data.track == null && !data.title) return emptySongResult();
 
   const track = data.track && typeof data.track === 'object' ? data.track : data;
-  if (!track.title) {
-    return { matched: false, title: null, artist: null, album: null, genres: [], shazam_url: null };
-  }
+  if (!track.title) return emptySongResult();
+
+  const images = track.images && typeof track.images === 'object' ? track.images : {};
+  const cover =
+    (typeof images.coverarthq === 'string' && images.coverarthq) ||
+    (typeof images.coverart === 'string' && images.coverart) ||
+    (typeof images.background === 'string' && images.background) ||
+    null;
 
   const genres = [];
   if (typeof track.genres?.primary === 'string') genres.push(track.genres.primary);
@@ -479,13 +519,34 @@ function normalizeShazamResponse(data) {
     }
   }
 
+  const hub = track.hub && typeof track.hub === 'object' ? track.hub : {};
+  let appleUrl =
+    hub.options?.[0]?.actions?.[0]?.uri ||
+    hub.actions?.[0]?.uri ||
+    null;
+  if (typeof appleUrl !== 'string') appleUrl = null;
+
+  let youtubeUrl = hubProviderUrl(hub, 'youtube');
+  for (const section of sections) {
+    const yt = section?.youtubeurl?.actions?.[0]?.uri;
+    if (typeof yt === 'string' && yt) {
+      youtubeUrl = yt;
+      break;
+    }
+  }
+
   return {
     matched: true,
     title: track.title || null,
     artist: track.subtitle || null,
     album,
     genres,
+    cover_art: cover,
     shazam_url: typeof track.url === 'string' ? track.url : null,
+    apple_music_url: appleUrl,
+    spotify_url: hubProviderUrl(hub, 'spotify'),
+    youtube_url: youtubeUrl,
+    score: null,
   };
 }
 
@@ -532,15 +593,7 @@ function acrCloudConfigured() {
 }
 
 function normalizeAcrCloudResponse(data) {
-  const empty = {
-    matched: false,
-    title: null,
-    artist: null,
-    album: null,
-    genres: [],
-    shazam_url: null,
-    score: null,
-  };
+  const empty = emptySongResult();
 
   if (!data || typeof data !== 'object') return empty;
 
@@ -568,9 +621,17 @@ function normalizeAcrCloudResponse(data) {
 
   const spotifyId = track.external_metadata?.spotify?.track?.id;
   const youtubeId = track.external_metadata?.youtube?.vid;
-  let link = null;
-  if (spotifyId) link = `https://open.spotify.com/track/${spotifyId}`;
-  else if (youtubeId) link = `https://www.youtube.com/watch?v=${youtubeId}`;
+  const spotifyUrl = spotifyId
+    ? `https://open.spotify.com/track/${spotifyId}`
+    : null;
+  const youtubeUrl = youtubeId
+    ? `https://youtu.be/${youtubeId}`
+    : null;
+
+  const cover =
+    (typeof track.album?.cover === 'string' && track.album.cover) ||
+    (typeof track.album?.cover_art === 'string' && track.album.cover_art) ||
+    null;
 
   return {
     matched: true,
@@ -578,7 +639,11 @@ function normalizeAcrCloudResponse(data) {
     artist: artists.join(', ') || null,
     album: track.album?.name || null,
     genres,
-    shazam_url: link,
+    cover_art: cover,
+    shazam_url: null,
+    apple_music_url: null,
+    spotify_url: spotifyUrl,
+    youtube_url: youtubeUrl,
     score: typeof track.score === 'number' ? track.score : null,
   };
 }
@@ -746,6 +811,79 @@ async function identifyViaPhp(streamUrl) {
   }
 }
 
+/** Prefer https links WhatsApp can open; drop intent:// and other app schemes. */
+function cleanHttpUrl(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const value = raw.trim();
+  if (!value) return null;
+
+  if (value.startsWith('intent://')) {
+    const path = value.slice('intent://'.length).split('#')[0];
+    if (path) return `https://${path}`;
+  }
+
+  if (value.startsWith('spotify:search:')) {
+    const q = value.slice('spotify:search:'.length);
+    try {
+      return `https://open.spotify.com/search/${decodeURIComponent(q)}`;
+    } catch (_) {
+      return `https://open.spotify.com/search/${q}`;
+    }
+  }
+
+  if (value.startsWith('https://') || value.startsWith('http://')) {
+    return value;
+  }
+
+  return null;
+}
+
+function shortenYoutubeUrl(url) {
+  try {
+    const u = new URL(url);
+    if (!/youtu\.?be|youtube\.com/i.test(u.hostname)) return url;
+    const id =
+      u.searchParams.get('v') ||
+      (u.hostname.includes('youtu.be') ? u.pathname.split('/').filter(Boolean)[0] : null);
+    return id ? `https://youtu.be/${id}` : url;
+  } catch (_) {
+    return url;
+  }
+}
+
+/** Trim tracking noise so WhatsApp captions stay short. */
+function tidyListenUrl(url) {
+  try {
+    const u = new URL(url);
+    if (/apple\.com|itunes\.apple\.com/i.test(u.hostname)) {
+      u.search = '';
+      u.hash = '';
+      return u.toString();
+    }
+    if (/open\.spotify\.com/i.test(u.hostname)) {
+      u.search = '';
+      u.hash = '';
+      return u.toString();
+    }
+    return shortenYoutubeUrl(url);
+  } catch (_) {
+    return url;
+  }
+}
+
+/** Short listen links like the web — Apple Music / Spotify / YouTube (never Shazam). */
+function songListenLinks(song) {
+  const links = [];
+  const apple = cleanHttpUrl(song.apple_music_url);
+  const spotify = cleanHttpUrl(song.spotify_url);
+  const youtube = cleanHttpUrl(song.youtube_url);
+
+  if (apple) links.push({ label: 'Apple Music', url: tidyListenUrl(apple) });
+  if (spotify) links.push({ label: 'Spotify', url: tidyListenUrl(spotify) });
+  if (youtube) links.push({ label: 'YouTube', url: tidyListenUrl(youtube) });
+  return links;
+}
+
 function formatSongMessage(stationTitle, data) {
   const song = data.song || {};
 
@@ -763,12 +901,40 @@ function formatSongMessage(stationTitle, data) {
     song.artist || 'Unknown artist',
   ];
 
-  if (song.album) lines.push(`Album: ${song.album}`);
-  if (song.genres?.length) lines.push(`Genre: ${song.genres.join(', ')}`);
-  if (typeof song.score === 'number') lines.push(`Confidence: ${song.score}%`);
+  if (song.album) lines.push(song.album);
+  if (song.genres?.length) lines.push(song.genres.join(', '));
 
-  // Song details only — never surface Shazam (or other provider) links to the user.
+  const links = songListenLinks(song);
+  if (links.length) {
+    lines.push('');
+    for (const { label, url } of links) {
+      lines.push(`${label}\n${url}`);
+    }
+  }
+
   return lines.join('\n');
+}
+
+async function sendSongResult(to, stationTitle, data) {
+  const song = data.song || {};
+  const text = formatSongMessage(stationTitle, data);
+
+  if (!song.matched) {
+    await sendText(to, text, { previewUrl: false });
+    return;
+  }
+
+  const cover = cleanHttpUrl(song.cover_art);
+  if (cover) {
+    const body = await sendImage(to, cover, text);
+    // If WhatsApp rejects the remote image link, fall back to text.
+    if (!body?.error) return;
+    console.warn('Cover image send failed, falling back to text', body.error);
+  }
+
+  await sendText(to, text, {
+    previewUrl: songListenLinks(song).length > 0,
+  });
 }
 
 function formatHummingNoMatch() {
@@ -909,9 +1075,7 @@ async function handleIdentify(to, station) {
       artist: song.artist || '',
       genres: song.genres || [],
     });
-    await sendText(to, formatSongMessage(station.title, data), {
-      previewUrl: false,
-    });
+    await sendSongResult(to, station.title, data);
   } catch (err) {
     await logUsage({
       event: 'error',
@@ -962,9 +1126,7 @@ async function handleHummingAudio(to, mediaId) {
     if (!song.matched) {
       await sendText(to, formatHummingNoMatch(), { previewUrl: false });
     } else {
-      await sendText(to, formatSongMessage('Hum or detect', data), {
-        previewUrl: false,
-      });
+      await sendSongResult(to, 'Hum or detect', data);
     }
   } catch (err) {
     await logUsage({
