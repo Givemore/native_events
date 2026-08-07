@@ -855,13 +855,14 @@ function cleanHttpUrl(raw) {
     if (path) return `https://${path}`;
   }
 
+  if (value.startsWith('spotify:track:')) {
+    const id = value.slice('spotify:track:'.length).split('?')[0];
+    return id ? `https://open.spotify.com/track/${id}` : null;
+  }
+
   if (value.startsWith('spotify:search:')) {
-    const q = value.slice('spotify:search:'.length);
-    try {
-      return `https://open.spotify.com/search/${decodeURIComponent(q)}`;
-    } catch (_) {
-      return `https://open.spotify.com/search/${q}`;
-    }
+    // Handled later with a readable + query — don't emit %20 junk here.
+    return value;
   }
 
   if (value.startsWith('https://') || value.startsWith('http://')) {
@@ -884,19 +885,44 @@ function shortenYoutubeUrl(url) {
   }
 }
 
-/** Trim tracking noise so WhatsApp captions stay short. */
+/** Readable search query for URLs (avoid %20 / %26 walls of text). */
+function plusQuery(...parts) {
+  return parts
+    .filter(Boolean)
+    .join(' ')
+    .trim()
+    .replace(/&/g, 'and')
+    .replace(/\s+/g, '+');
+}
+
+/** Trim tracking noise; keep search links readable. */
 function tidyListenUrl(url) {
   try {
+    if (url.startsWith('spotify:search:')) {
+      return null; // resolved in songListenLinks
+    }
     const u = new URL(url);
     if (/apple\.com|itunes\.apple\.com/i.test(u.hostname)) {
       u.search = '';
       u.hash = '';
       return u.toString();
     }
-    if (/open\.spotify\.com/i.test(u.hostname)) {
+    if (/open\.spotify\.com\/track\//i.test(u.href)) {
       u.search = '';
       u.hash = '';
       return u.toString();
+    }
+    if (/open\.spotify\.com\/search\//i.test(u.href)) {
+      const q = decodeURIComponent(u.pathname.replace(/^\/search\//, '')).replace(/\+/g, ' ');
+      const clean = plusQuery(q);
+      return clean ? `https://open.spotify.com/search/${clean}` : url;
+    }
+    if (/youtube\.com\/results/i.test(u.href)) {
+      const q = u.searchParams.get('search_query') || '';
+      const clean = plusQuery(q);
+      return clean
+        ? `https://www.youtube.com/results?search_query=${clean}`
+        : url;
     }
     return shortenYoutubeUrl(url);
   } catch (_) {
@@ -904,25 +930,64 @@ function tidyListenUrl(url) {
   }
 }
 
-/** Short listen links like the web — Apple Music / Spotify / YouTube (never Shazam). */
+function isDirectTrackUrl(url) {
+  if (!url) return false;
+  return (
+    /open\.spotify\.com\/track\//i.test(url) ||
+    /youtu\.be\/|youtube\.com\/watch/i.test(url) ||
+    /music\.apple\.com\//i.test(url)
+  );
+}
+
+/** Compact listen links — prefer real track URLs; searchable fallbacks stay short. */
 function songListenLinks(song) {
   const links = [];
-  const apple = cleanHttpUrl(song.apple_music_url);
-  const spotify = cleanHttpUrl(song.spotify_url);
-  let youtube = cleanHttpUrl(song.youtube_url);
 
-  // Shazam often omits YouTube — fall back to a search for this track.
-  if (!youtube) {
-    const q = [song.artist, song.title].filter(Boolean).join(' ').trim();
-    if (q) {
-      youtube = `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`;
-    }
+  let apple = cleanHttpUrl(song.apple_music_url);
+  if (apple) apple = tidyListenUrl(apple) || apple;
+
+  let spotify = cleanHttpUrl(song.spotify_url);
+  if (typeof song.spotify_url === 'string' && song.spotify_url.startsWith('spotify:search:')) {
+    spotify = null;
+  } else if (spotify) {
+    spotify = tidyListenUrl(spotify) || spotify;
+  }
+  if (!isDirectTrackUrl(spotify)) {
+    const q = plusQuery(song.title, song.artist);
+    spotify = q ? `https://open.spotify.com/search/${q}` : null;
   }
 
-  if (apple) links.push({ label: 'Apple Music', url: tidyListenUrl(apple) });
-  if (spotify) links.push({ label: 'Spotify', url: tidyListenUrl(spotify) });
-  if (youtube) links.push({ label: 'YouTube', url: tidyListenUrl(youtube) });
+  let youtube = cleanHttpUrl(song.youtube_url);
+  if (youtube) youtube = tidyListenUrl(youtube) || youtube;
+  if (!isDirectTrackUrl(youtube)) {
+    const q = plusQuery(song.artist, song.title);
+    youtube = q ? `https://www.youtube.com/results?search_query=${q}` : null;
+  }
+
+  if (apple) links.push({ label: 'Apple Music', url: apple });
+  if (spotify) links.push({ label: 'Spotify', url: spotify });
+  if (youtube) links.push({ label: 'YouTube', url: youtube });
   return links;
+}
+
+function formatSongDetails(stationTitle, song) {
+  const lines = [
+    `*${stationTitle}*`,
+    '',
+    `*Title:* ${song.title || 'Unknown title'}`,
+    `*Artist:* ${song.artist || 'Unknown artist'}`,
+  ];
+  if (song.album) lines.push(`*Album:* ${song.album}`);
+  if (song.genres?.length) lines.push(`*Genre:* ${song.genres.join(', ')}`);
+  if (typeof song.score === 'number') lines.push(`*Confidence:* ${song.score}%`);
+  return lines.join('\n');
+}
+
+function formatListenLinks(song) {
+  const links = songListenLinks(song);
+  if (!links.length) return null;
+  // One short line per service — no label/URL double-stack
+  return ['*Listen*', ...links.map(({ label, url }) => `• ${label}: ${url}`)].join('\n');
 }
 
 function formatSongMessage(stationTitle, data) {
@@ -935,47 +1000,37 @@ function formatSongMessage(stationTitle, data) {
     );
   }
 
-  const lines = [
-    `*${stationTitle}*`,
-    '',
-    `*Title:* ${song.title || 'Unknown title'}`,
-    `*Artist:* ${song.artist || 'Unknown artist'}`,
-  ];
-
-  if (song.album) lines.push(`*Album:* ${song.album}`);
-  if (song.genres?.length) lines.push(`*Genre:* ${song.genres.join(', ')}`);
-  if (typeof song.score === 'number') lines.push(`*Confidence:* ${song.score}%`);
-
-  const links = songListenLinks(song);
-  if (links.length) {
-    lines.push('');
-    for (const { label, url } of links) {
-      lines.push(`${label}\n${url}`);
-    }
-  }
-
-  return lines.join('\n');
+  const details = formatSongDetails(stationTitle, song);
+  const listen = formatListenLinks(song);
+  return listen ? `${details}\n\n${listen}` : details;
 }
 
 async function sendSongResult(to, stationTitle, data) {
   const song = data.song || {};
-  const text = formatSongMessage(stationTitle, data);
 
   if (!song.matched) {
-    await sendText(to, text, { previewUrl: false });
+    await sendText(to, formatSongMessage(stationTitle, data), { previewUrl: false });
     return;
   }
 
+  const details = formatSongDetails(stationTitle, song);
+  const listen = formatListenLinks(song);
   const cover = cleanHttpUrl(song.cover_art);
+
+  // Cover + clean details only — keep long URLs out of the image caption
   if (cover) {
-    const body = await sendImage(to, cover, text);
-    // If WhatsApp rejects the remote image link, fall back to text.
-    if (!body?.error) return;
+    const body = await sendImage(to, cover, details);
+    if (!body?.error) {
+      if (listen) {
+        await sendText(to, listen, { previewUrl: false });
+      }
+      return;
+    }
     console.warn('Cover image send failed, falling back to text', body.error);
   }
 
-  await sendText(to, text, {
-    previewUrl: songListenLinks(song).length > 0,
+  await sendText(to, listen ? `${details}\n\n${listen}` : details, {
+    previewUrl: false,
   });
 }
 
