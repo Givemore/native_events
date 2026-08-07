@@ -69,11 +69,11 @@ async function sendWhatsApp(payload) {
   return body;
 }
 
-async function sendText(to, text) {
+async function sendText(to, text, { previewUrl = true } = {}) {
   return sendWhatsApp({
     to,
     type: 'text',
-    text: { preview_url: true, body: text },
+    text: { preview_url: previewUrl, body: text },
   });
 }
 
@@ -193,14 +193,42 @@ async function captureStreamAudio(streamUrl, seconds = sampleSeconds) {
   }
 }
 
+/** Prefer https links WhatsApp can open; drop intent:// and other app schemes. */
+function cleanHttpUrl(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const value = raw.trim();
+  if (!value) return null;
+
+  // Android intent → https Apple Music URL
+  if (value.startsWith('intent://')) {
+    const path = value.slice('intent://'.length).split('#')[0];
+    if (path) return `https://${path}`;
+  }
+
+  // Spotify search URI → web search
+  if (value.startsWith('spotify:search:')) {
+    const q = value.slice('spotify:search:'.length);
+    try {
+      return `https://open.spotify.com/search/${decodeURIComponent(q)}`;
+    } catch (_) {
+      return `https://open.spotify.com/search/${q}`;
+    }
+  }
+
+  if (value.startsWith('https://') || value.startsWith('http://')) {
+    return value;
+  }
+
+  return null;
+}
+
 function formatSongMessage(stationTitle, data) {
   const song = data.song || {};
 
   if (!song.matched) {
     return (
       `🎧 *${stationTitle}*\n\n` +
-      `No match this time — try again when a song is playing (not ads or talk).\n\n` +
-      `Web: ${webAppUrl}`
+      `Couldn’t find a match — try again when a song is playing (not ads or talk).`
     );
   }
 
@@ -214,19 +242,57 @@ function formatSongMessage(stationTitle, data) {
   if (song.album) lines.push(`Album: ${song.album}`);
   if (song.genres?.length) lines.push(`Genre: ${song.genres.join(', ')}`);
 
-  const links = [
-    song.shazam_url && `Shazam: ${song.shazam_url}`,
-    song.spotify_url && `Spotify: ${song.spotify_url}`,
-    song.youtube_url && `YouTube: ${song.youtube_url}`,
-    song.apple_music_url && `Apple Music: ${song.apple_music_url}`,
-  ].filter(Boolean);
-
-  if (links.length) {
-    lines.push('', ...links);
+  // One clean Shazam link (WhatsApp shows a nice preview). Skip long/noisy extras.
+  const shazam = cleanHttpUrl(song.shazam_url);
+  if (shazam) {
+    lines.push('', shazam);
   }
 
-  lines.push('', `More: ${webAppUrl}`);
   return lines.join('\n');
+}
+
+function isTechnicalError(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  const technicalHints = [
+    'timeout',
+    'timed out',
+    'fetch failed',
+    'econn',
+    'enotfound',
+    'socket',
+    'proxy',
+    'http ',
+    '502',
+    '503',
+    '500',
+    '401',
+    'curl',
+    'ffmpeg',
+    'abort',
+    'network',
+    'identify failed',
+    'capture',
+    'unauthorized',
+    'ssl',
+    'certificate',
+  ];
+  return technicalHints.some((hint) => msg.includes(hint));
+}
+
+function formatIdentifyError(stationTitle, err) {
+  console.error('Identify error', err);
+
+  if (isTechnicalError(err)) {
+    return (
+      `🎧 *${stationTitle}*\n\n` +
+      `We hit a technical error while listening to the station. Please try again in a moment.`
+    );
+  }
+
+  return (
+    `🎧 *${stationTitle}*\n\n` +
+    `Sorry — I couldn’t identify what’s playing right now. Please try again shortly.`
+  );
 }
 
 async function handleIdentify(to, station) {
@@ -237,13 +303,14 @@ async function handleIdentify(to, station) {
 
   try {
     const data = await identifyStream(station.streamUrl);
-    await sendText(to, formatSongMessage(station.title, data));
+    // Shazam link gets a nice preview card; keep that on.
+    await sendText(to, formatSongMessage(station.title, data), {
+      previewUrl: Boolean(data?.song?.shazam_url && data?.song?.matched),
+    });
   } catch (err) {
-    console.error('Identify error', err);
-    await sendText(
-      to,
-      `Sorry — I couldn’t identify ${station.title} right now.\n${err.message || err}\n\nTry again or use the web app: ${webAppUrl}`
-    );
+    await sendText(to, formatIdentifyError(station.title, err), {
+      previewUrl: false,
+    });
   }
 
   await sendStationButtons(to);
