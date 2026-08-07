@@ -138,19 +138,30 @@ async function sendStationButtons(to, name) {
 
 async function logUsage(partial) {
   if (!usageIngestUrl) return;
+  if (!usageIngestSecret) {
+    console.warn(
+      'Usage log skipped: set USAGE_INGEST_SECRET on Render to match PHP usage_ingest_secret'
+    );
+    return;
+  }
   try {
-    const headers = { 'Content-Type': 'application/json' };
-    if (usageIngestSecret) {
-      headers['X-Usage-Secret'] = usageIngestSecret;
-    }
-    await fetch(usageIngestUrl, {
+    const res = await fetch(usageIngestUrl, {
       method: 'POST',
-      headers,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Usage-Secret': usageIngestSecret,
+      },
       body: JSON.stringify({
         channel: 'whatsapp',
         ...partial,
       }),
     });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.warn(
+        `Usage log failed: HTTP ${res.status}${body ? ` ${body.slice(0, 200)}` : ''}`
+      );
+    }
   } catch (err) {
     console.warn('Usage log failed:', err.message || err);
   }
@@ -1031,7 +1042,8 @@ app.get('/health', (_req, res) => {
     acrcloudConfigured: acrCloudConfigured(),
     acrcloudHost: acrHost,
     whatsappConfigured: Boolean(whatsappToken && phoneNumberId),
-    usageLoggingConfigured: Boolean(usageIngestUrl),
+    usageLoggingConfigured: Boolean(usageIngestUrl && usageIngestSecret),
+    usageIngestSecretConfigured: Boolean(usageIngestSecret),
   });
 });
 
