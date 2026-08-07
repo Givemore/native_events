@@ -528,11 +528,22 @@ function normalizeShazamResponse(data) {
 
   let youtubeUrl = hubProviderUrl(hub, 'youtube');
   for (const section of sections) {
-    const yt = section?.youtubeurl?.actions?.[0]?.uri;
-    if (typeof yt === 'string' && yt) {
-      youtubeUrl = yt;
-      break;
+    const actions = section?.youtubeurl?.actions;
+    if (!Array.isArray(actions)) continue;
+    for (const action of actions) {
+      if (typeof action?.uri === 'string' && action.uri) {
+        youtubeUrl = action.uri;
+        break;
+      }
     }
+    if (youtubeUrl) break;
+  }
+  if (!youtubeUrl && typeof track.url === 'string' && /youtu\.?be|youtube\.com/i.test(track.url)) {
+    youtubeUrl = track.url;
+  }
+  // Last resort: scan hub/actions for any YouTube URI
+  if (!youtubeUrl) {
+    youtubeUrl = findYoutubeUri(track);
   }
 
   return {
@@ -548,6 +559,28 @@ function normalizeShazamResponse(data) {
     youtube_url: youtubeUrl,
     score: null,
   };
+}
+
+/** Walk a Shazam track payload for any YouTube-looking URI. */
+function findYoutubeUri(node, depth = 0) {
+  if (depth > 6 || node == null) return null;
+  if (typeof node === 'string') {
+    return /youtu\.?be|youtube\.com/i.test(node) ? node : null;
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findYoutubeUri(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof node === 'object') {
+    for (const value of Object.values(node)) {
+      const found = findYoutubeUri(value, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 async function recognizeWithShazam(audioBuffer) {
@@ -876,7 +909,15 @@ function songListenLinks(song) {
   const links = [];
   const apple = cleanHttpUrl(song.apple_music_url);
   const spotify = cleanHttpUrl(song.spotify_url);
-  const youtube = cleanHttpUrl(song.youtube_url);
+  let youtube = cleanHttpUrl(song.youtube_url);
+
+  // Shazam often omits YouTube — fall back to a search for this track.
+  if (!youtube) {
+    const q = [song.artist, song.title].filter(Boolean).join(' ').trim();
+    if (q) {
+      youtube = `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`;
+    }
+  }
 
   if (apple) links.push({ label: 'Apple Music', url: tidyListenUrl(apple) });
   if (spotify) links.push({ label: 'Spotify', url: tidyListenUrl(spotify) });
@@ -897,12 +938,13 @@ function formatSongMessage(stationTitle, data) {
   const lines = [
     `*${stationTitle}*`,
     '',
-    `*${song.title || 'Unknown title'}*`,
-    song.artist || 'Unknown artist',
+    `*Title:* ${song.title || 'Unknown title'}`,
+    `*Artist:* ${song.artist || 'Unknown artist'}`,
   ];
 
-  if (song.album) lines.push(song.album);
-  if (song.genres?.length) lines.push(song.genres.join(', '));
+  if (song.album) lines.push(`*Album:* ${song.album}`);
+  if (song.genres?.length) lines.push(`*Genre:* ${song.genres.join(', ')}`);
+  if (typeof song.score === 'number') lines.push(`*Confidence:* ${song.score}%`);
 
   const links = songListenLinks(song);
   if (links.length) {
