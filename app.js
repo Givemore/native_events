@@ -96,6 +96,61 @@ async function sendText(to, text, { previewUrl = true } = {}) {
   });
 }
 
+/**
+ * Upload a buffer to WhatsApp Cloud API media storage.
+ * Returns the media id used by sendAudio / other media messages.
+ */
+async function uploadWhatsAppMedia(buffer, mimeType = 'audio/mpeg', filename = 'clip.mp3') {
+  if (!whatsappToken || !phoneNumberId) {
+    throw new Error('Missing WHATSAPP_TOKEN or PHONE_NUMBER_ID');
+  }
+  if (!Buffer.isBuffer(buffer) || buffer.length < 500) {
+    throw new Error(`Audio clip too small (${buffer?.length || 0} bytes)`);
+  }
+
+  const form = new FormData();
+  form.append('messaging_product', 'whatsapp');
+  form.append('type', mimeType);
+  form.append('file', new Blob([buffer], { type: mimeType }), filename);
+
+  const response = await fetch(graphUrl(`${phoneNumberId}/media`), {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${whatsappToken}` },
+    body: form,
+  });
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !body.id) {
+    throw new Error(
+      body.error?.message || `Media upload failed (HTTP ${response.status})`
+    );
+  }
+  return body.id;
+}
+
+async function sendAudio(to, mediaId, { voice = false } = {}) {
+  return sendWhatsApp({
+    to,
+    type: 'audio',
+    audio: { id: mediaId, voice },
+  });
+}
+
+/** Upload a ~10s stream snap and send it as a playable WhatsApp audio message. */
+async function sendStreamClip(to, audioBuffer, stationTitle) {
+  const mediaId = await uploadWhatsAppMedia(
+    audioBuffer,
+    'audio/mpeg',
+    'stream-clip.mp3'
+  );
+  await sendText(
+    to,
+    `🔊 *${stationTitle}* — here’s ~${sampleSeconds}s of what’s on air:`,
+    { previewUrl: false }
+  );
+  return sendAudio(to, mediaId, { voice: false });
+}
+
 async function sendStationButtons(to, name) {
   const greeting = name ? `Hi ${name}! ` : '';
   return sendWhatsApp({
@@ -653,6 +708,7 @@ async function identifyLocally(streamUrl) {
             attempt,
           },
           song,
+          audio,
         };
       }
 
@@ -844,12 +900,39 @@ function formatHummingError(err) {
 async function handleIdentify(to, station) {
   await sendText(
     to,
-    `Checking what’s playing on *${station.title}*… usually about 10–20 seconds.`
+    `Checking what’s playing on *${station.title}*… I’ll also send a ~${sampleSeconds}s audio snap.`
   );
 
   try {
     const data = await identifyStream(station.streamUrl);
     const song = data.song || {};
+
+    // Reuse the identify sample when available; otherwise capture a fresh snap
+    // (PHP fallback path doesn’t return audio).
+    let clip = Buffer.isBuffer(data.audio) ? data.audio : null;
+    if (!clip) {
+      try {
+        clip = await captureWithRetries(station.streamUrl, sampleSeconds, 2);
+      } catch (clipErr) {
+        console.warn('Stream clip capture failed:', clipErr.message || clipErr);
+      }
+    }
+
+    if (clip) {
+      try {
+        await sendStreamClip(to, clip, station.title);
+        await logUsage({
+          event: 'clip',
+          user_id: to,
+          phone: to,
+          station: station.title,
+          meta: { seconds: sampleSeconds, bytes: clip.length },
+        });
+      } catch (clipErr) {
+        console.warn('Stream clip send failed:', clipErr.message || clipErr);
+      }
+    }
+
     await logUsage({
       event: 'identify',
       user_id: to,
