@@ -145,7 +145,7 @@ async function sendStreamClip(to, audioBuffer, stationTitle) {
   );
   await sendText(
     to,
-    `🔊 *${stationTitle}* — here’s ~${sampleSeconds}s of what’s on air:`,
+    `*${stationTitle}* — here’s ~${sampleSeconds}s of what’s on air:`,
     { previewUrl: false }
   );
   return sendAudio(to, mediaId, { voice: false });
@@ -225,7 +225,7 @@ async function logUsage(partial) {
 async function sendHumInstructions(to) {
   return sendText(
     to,
-    '🎵 *Hum or detect a song*\n\n' +
+    '*Hum or detect a song*\n\n' +
       'Send a voice note (about *10–15 seconds*):\n' +
       '• Hum or sing the melody, or\n' +
       '• Hold your phone near a song that’s playing\n\n' +
@@ -780,13 +780,13 @@ function formatSongMessage(stationTitle, data) {
 
   if (!song.matched) {
     return (
-      `🎧 *${stationTitle}*\n\n` +
+      `*${stationTitle}*\n\n` +
       `Couldn’t find a match — try again when a song is playing (not ads or talk).`
     );
   }
 
   const lines = [
-    `🎧 *${stationTitle}*`,
+    `*${stationTitle}*`,
     '',
     `*${song.title || 'Unknown title'}*`,
     song.artist || 'Unknown artist',
@@ -807,7 +807,7 @@ function formatSongMessage(stationTitle, data) {
 
 function formatHummingNoMatch() {
   return (
-    `🎵 *Hum or detect*\n\n` +
+    `*Hum or detect*\n\n` +
     `Couldn’t match that tune. Try a clearer 10–15s voice note — hum the melody, or hold your phone near the song.`
   );
 }
@@ -847,13 +847,13 @@ function formatIdentifyError(stationTitle, err) {
 
   if (isTechnicalError(err)) {
     return (
-      `🎧 *${stationTitle}*\n\n` +
+      `*${stationTitle}*\n\n` +
       `We hit a technical error while listening to the station. Please try again in a moment.`
     );
   }
 
   return (
-    `🎧 *${stationTitle}*\n\n` +
+    `*${stationTitle}*\n\n` +
     `Sorry — I couldn’t identify what’s playing right now. Please try again shortly.`
   );
 }
@@ -863,7 +863,7 @@ function formatHummingError(err) {
 
   if (!acrCloudConfigured()) {
     return (
-      `🎵 *Hum or detect*\n\n` +
+      `*Hum or detect*\n\n` +
       `This option isn’t set up yet on the server. Please try again later.`
     );
   }
@@ -879,20 +879,20 @@ function formatHummingError(err) {
     msg.includes('status 30')
   ) {
     return (
-      `🎵 *Hum or detect*\n\n` +
+      `*Hum or detect*\n\n` +
       `ACRCloud rejected the credentials. Use the *project* Access Key + Access Secret from your AVR humming project (not Old Access Keys / Personal Access Token), then redeploy.`
     );
   }
 
   if (isTechnicalError(err)) {
     return (
-      `🎵 *Hum or detect*\n\n` +
+      `*Hum or detect*\n\n` +
       `We hit a technical error while checking your voice note. Please try again in a moment.`
     );
   }
 
   return (
-    `🎵 *Hum or detect*\n\n` +
+    `*Hum or detect*\n\n` +
     `Sorry — I couldn’t identify that tune. Please try again shortly.`
   );
 }
