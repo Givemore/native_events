@@ -96,9 +96,6 @@ async function sendStationButtons(to, name) {
         text:
           `${greeting}Pick a Botswana station and I’ll identify what’s playing right now.`,
       },
-      footer: {
-        text: 'StreamID · moeng.io/mvumba',
-      },
       action: {
         buttons: Object.values(STATIONS).map((station) => ({
           type: 'reply',
