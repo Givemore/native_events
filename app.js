@@ -34,6 +34,11 @@ const sampleSeconds = Math.min(
 );
 
 const ACTION_HUM = 'action_hum';
+const ACTION_LISTEN = 'action_listen';
+const ACTION_DETECT_AGAIN = 'action_detect_again';
+
+/** Last matched song links per WhatsApp user (for Listen picker). */
+const lastMatchByUser = new Map();
 
 // Botswana stations — button titles must be ≤ 20 chars (WhatsApp limit)
 const STATIONS = {
@@ -964,30 +969,56 @@ function songListenLinks(song) {
     youtube = q ? `https://www.youtube.com/results?search_query=${q}` : null;
   }
 
-  if (apple) links.push({ label: 'Apple Music', url: apple });
-  if (spotify) links.push({ label: 'Spotify', url: spotify });
-  if (youtube) links.push({ label: 'YouTube', url: youtube });
+  // Stable order matching the Listen picker
+  if (spotify) links.push({ id: 'listen_spotify', label: 'Spotify', url: spotify });
+  if (apple) links.push({ id: 'listen_apple', label: 'Apple Music', url: apple });
+  if (youtube) links.push({ id: 'listen_youtube', label: 'YouTube', url: youtube });
   return links;
 }
 
-function formatSongDetails(stationTitle, song) {
-  const lines = [
-    `*${stationTitle}*`,
-    '',
-    `*Title:* ${song.title || 'Unknown title'}`,
-    `*Artist:* ${song.artist || 'Unknown artist'}`,
-  ];
-  if (song.album) lines.push(`*Album:* ${song.album}`);
-  if (song.genres?.length) lines.push(`*Genre:* ${song.genres.join(', ')}`);
-  if (typeof song.score === 'number') lines.push(`*Confidence:* ${song.score}%`);
-  return lines.join('\n');
+function rememberMatch(to, stationTitle, song) {
+  lastMatchByUser.set(to, {
+    stationTitle,
+    title: song.title || '',
+    artist: song.artist || '',
+    links: songListenLinks(song),
+    detectedAt: Date.now(),
+  });
 }
 
-function formatListenLinks(song) {
+function formatDetectedAt(ts = Date.now()) {
+  return new Date(ts).toLocaleTimeString('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: 'Africa/Gaborone',
+  });
+}
+
+/** Cover first, then this compact card — no raw URLs. */
+function formatCompactSong(stationTitle, song, detectedAt = Date.now()) {
+  const lines = [
+    `🎵 *${song.title || 'Unknown title'}*`,
+    song.artist || 'Unknown artist',
+    '',
+  ];
+
+  if (song.album) lines.push(`💿 ${song.album}`);
+  if (song.genres?.length) lines.push(`🎶 ${song.genres.join(', ')}`);
+  lines.push(`📻 ${stationTitle}`);
+  lines.push('');
+  lines.push(`Detected at ${formatDetectedAt(detectedAt)}`);
+
   const links = songListenLinks(song);
-  if (!links.length) return null;
-  // One short line per service — no label/URL double-stack
-  return ['*Listen*', ...links.map(({ label, url }) => `• ${label}: ${url}`)].join('\n');
+  if (links.length) {
+    lines.push('');
+    lines.push('🎧 *Listen now*');
+    for (const { label } of links) {
+      lines.push(`• ${label}`);
+    }
+  }
+
+  return lines.join('\n');
 }
 
 function formatSongMessage(stationTitle, data) {
@@ -1000,9 +1031,95 @@ function formatSongMessage(stationTitle, data) {
     );
   }
 
-  const details = formatSongDetails(stationTitle, song);
-  const listen = formatListenLinks(song);
-  return listen ? `${details}\n\n${listen}` : details;
+  return formatCompactSong(stationTitle, song);
+}
+
+async function sendResultActions(to) {
+  return sendWhatsApp({
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text: 'Tap an option below' },
+      action: {
+        buttons: [
+          {
+            type: 'reply',
+            reply: { id: ACTION_LISTEN, title: '🎧 Listen' },
+          },
+          {
+            type: 'reply',
+            reply: { id: ACTION_DETECT_AGAIN, title: '🔄 Detect Again' },
+          },
+        ],
+      },
+    },
+  });
+}
+
+async function sendListenPicker(to) {
+  const match = lastMatchByUser.get(to);
+  if (!match?.links?.length) {
+    await sendText(
+      to,
+      'No recent song to open — detect a track first.',
+      { previewUrl: false }
+    );
+    await sendStationButtons(to);
+    return;
+  }
+
+  const numberEmojis = ['1️⃣', '2️⃣', '3️⃣'];
+  return sendWhatsApp({
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: { text: 'Where would you like to listen?' },
+      action: {
+        button: 'Choose app',
+        sections: [
+          {
+            title: 'Listen on',
+            rows: match.links.map((link, index) => ({
+              id: link.id,
+              title: `${numberEmojis[index] || `${index + 1}.`} ${link.label}`.slice(
+                0,
+                24
+              ),
+              description: `Open in ${link.label}`.slice(0, 72),
+            })),
+          },
+        ],
+      },
+    },
+  });
+}
+
+async function sendOpenListenLink(to, link) {
+  const display = `Open ${link.label}`.slice(0, 20);
+  const body = await sendWhatsApp({
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'cta_url',
+      body: {
+        text: `Open *${link.label}* to play this track.`,
+      },
+      action: {
+        name: 'cta_url',
+        parameters: {
+          display_text: display,
+          url: link.url,
+        },
+      },
+    },
+  });
+
+  // Fallback if CTA isn’t available for this number
+  if (body?.error) {
+    await sendText(to, `${link.label}\n${link.url}`, { previewUrl: true });
+  }
 }
 
 async function sendSongResult(to, stationTitle, data) {
@@ -1013,25 +1130,23 @@ async function sendSongResult(to, stationTitle, data) {
     return;
   }
 
-  const details = formatSongDetails(stationTitle, song);
-  const listen = formatListenLinks(song);
+  rememberMatch(to, stationTitle, song);
+  const compact = formatCompactSong(stationTitle, song);
   const cover = cleanHttpUrl(song.cover_art);
 
-  // Cover + clean details only — keep long URLs out of the image caption
+  // 1) Artwork first (no caption clutter)
   if (cover) {
-    const body = await sendImage(to, cover, details);
-    if (!body?.error) {
-      if (listen) {
-        await sendText(to, listen, { previewUrl: false });
-      }
-      return;
+    const body = await sendImage(to, cover);
+    if (body?.error) {
+      console.warn('Cover image send failed', body.error);
     }
-    console.warn('Cover image send failed, falling back to text', body.error);
   }
 
-  await sendText(to, listen ? `${details}\n\n${listen}` : details, {
-    previewUrl: false,
-  });
+  // 2) Compact details + platform names (no URLs)
+  await sendText(to, compact, { previewUrl: false });
+
+  // 3) Listen | Detect Again
+  await sendResultActions(to);
 }
 
 function formatHummingNoMatch() {
@@ -1129,38 +1244,12 @@ function formatHummingError(err) {
 async function handleIdentify(to, station) {
   await sendText(
     to,
-    `Checking what’s playing on *${station.title}*… I’ll also send a ~${sampleSeconds}s audio snap.`
+    `Checking what’s playing on *${station.title}*…`
   );
 
   try {
     const data = await identifyStream(station.streamUrl);
     const song = data.song || {};
-
-    // Reuse the identify sample when available; otherwise capture a fresh snap
-    // (PHP fallback path doesn’t return audio).
-    let clip = Buffer.isBuffer(data.audio) ? data.audio : null;
-    if (!clip) {
-      try {
-        clip = await captureWithRetries(station.streamUrl, sampleSeconds, 2);
-      } catch (clipErr) {
-        console.warn('Stream clip capture failed:', clipErr.message || clipErr);
-      }
-    }
-
-    if (clip) {
-      try {
-        await sendStreamClip(to, clip, station.title);
-        await logUsage({
-          event: 'clip',
-          user_id: to,
-          phone: to,
-          station: station.title,
-          meta: { seconds: sampleSeconds, bytes: clip.length },
-        });
-      } catch (clipErr) {
-        console.warn('Stream clip send failed:', clipErr.message || clipErr);
-      }
-    }
 
     await logUsage({
       event: 'identify',
@@ -1173,6 +1262,10 @@ async function handleIdentify(to, station) {
       genres: song.genres || [],
     });
     await sendSongResult(to, station.title, data);
+
+    if (!song.matched) {
+      await sendStationButtons(to);
+    }
   } catch (err) {
     await logUsage({
       event: 'error',
@@ -1184,9 +1277,8 @@ async function handleIdentify(to, station) {
     await sendText(to, formatIdentifyError(station.title, err), {
       previewUrl: false,
     });
+    await sendStationButtons(to);
   }
-
-  await sendStationButtons(to);
 }
 
 async function handleHummingAudio(to, mediaId) {
@@ -1222,6 +1314,7 @@ async function handleHummingAudio(to, mediaId) {
 
     if (!song.matched) {
       await sendText(to, formatHummingNoMatch(), { previewUrl: false });
+      await sendStationButtons(to);
     } else {
       await sendSongResult(to, 'Hum or detect', data);
     }
@@ -1234,9 +1327,8 @@ async function handleHummingAudio(to, mediaId) {
       error: String(err?.message || err || 'hum failed'),
     });
     await sendText(to, formatHummingError(err), { previewUrl: false });
+    await sendStationButtons(to);
   }
-
-  await sendStationButtons(to);
 }
 
 function extractIncomingMessages(body) {
@@ -1274,6 +1366,32 @@ async function handleMessage(msg) {
       meta: { action: 'hum' },
     });
     await sendHumInstructions(msg.from);
+    return;
+  }
+
+  if (msg.buttonId === ACTION_LISTEN) {
+    await sendListenPicker(msg.from);
+    return;
+  }
+
+  if (msg.buttonId === ACTION_DETECT_AGAIN) {
+    await sendStationButtons(msg.from, msg.name);
+    return;
+  }
+
+  if (msg.buttonId.startsWith('listen_')) {
+    const match = lastMatchByUser.get(msg.from);
+    const link = match?.links?.find((l) => l.id === msg.buttonId);
+    if (link) {
+      await sendOpenListenLink(msg.from, link);
+    } else {
+      await sendText(
+        msg.from,
+        'That listen link expired — detect the song again.',
+        { previewUrl: false }
+      );
+      await sendStationButtons(msg.from, msg.name);
+    }
     return;
   }
 
