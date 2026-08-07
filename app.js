@@ -101,26 +101,28 @@ async function sendStationButtons(to, name) {
       type: 'list',
       body: {
         text:
-          `${greeting}Pick a Botswana station, or hum / record a song as a voice note.`,
+          `${greeting}What’s this song?\n\n` +
+          `• Pick a radio station to hear what’s playing now\n` +
+          `• Or hum / detect a song from a voice note`,
       },
       action: {
-        button: 'Choose option',
+        button: 'What’s this song',
         sections: [
           {
-            title: 'Radio stations',
+            title: 'What’s playing',
             rows: Object.values(STATIONS).map((station) => ({
               id: station.id,
               title: station.title,
-              description: 'Identify what’s playing now',
+              description: 'What’s this song playing',
             })),
           },
           {
-            title: 'Humming',
+            title: 'Hum or detect',
             rows: [
               {
                 id: ACTION_HUM,
                 title: 'Hum or detect a song',
-                description: 'Then send a voice note (10–15s)',
+                description: 'Send a 10–15s voice note',
               },
             ],
           },
@@ -134,8 +136,10 @@ async function sendHumInstructions(to) {
   return sendText(
     to,
     '🎵 *Hum or detect a song*\n\n' +
-      'Record a voice note humming/singing the melody, or playing a song nearby, for about *10–15 seconds*, then send it.\n\n' +
-      'Tip: keep it clear, one tune at a time — works best without background noise.',
+      'Send a voice note (about *10–15 seconds*):\n' +
+      '• Hum or sing the melody, or\n' +
+      '• Hold your phone near a song that’s playing\n\n' +
+      'Tip: one clear tune works best — avoid heavy background noise.',
     { previewUrl: false }
   );
 }
@@ -712,8 +716,8 @@ function formatSongMessage(stationTitle, data) {
 
 function formatHummingNoMatch() {
   return (
-    `🎵 *Humming*\n\n` +
-    `Couldn’t match that tune. Try again with a clearer 10–15s hum, or hum a more distinctive part of the melody.`
+    `🎵 *Hum or detect*\n\n` +
+    `Couldn’t match that tune. Try a clearer 10–15s voice note — hum the melody, or hold your phone near the song.`
   );
 }
 
@@ -768,8 +772,8 @@ function formatHummingError(err) {
 
   if (!acrCloudConfigured()) {
     return (
-      `🎵 *Humming*\n\n` +
-      `Humming isn’t set up yet on the server. Please try again later.`
+      `🎵 *Hum or detect*\n\n` +
+      `This option isn’t set up yet on the server. Please try again later.`
     );
   }
 
@@ -784,20 +788,20 @@ function formatHummingError(err) {
     msg.includes('status 30')
   ) {
     return (
-      `🎵 *Humming*\n\n` +
+      `🎵 *Hum or detect*\n\n` +
       `ACRCloud rejected the credentials. Use the *project* Access Key + Access Secret from your AVR humming project (not Old Access Keys / Personal Access Token), then redeploy.`
     );
   }
 
   if (isTechnicalError(err)) {
     return (
-      `🎵 *Humming*\n\n` +
-      `We hit a technical error while identifying your voice note. Please try again in a moment.`
+      `🎵 *Hum or detect*\n\n` +
+      `We hit a technical error while checking your voice note. Please try again in a moment.`
     );
   }
 
   return (
-    `🎵 *Humming*\n\n` +
+    `🎵 *Hum or detect*\n\n` +
     `Sorry — I couldn’t identify that tune. Please try again shortly.`
   );
 }
@@ -805,7 +809,7 @@ function formatHummingError(err) {
 async function handleIdentify(to, station) {
   await sendText(
     to,
-    `Listening to *${station.title}*… usually about 10–20 seconds.`
+    `Checking what’s playing on *${station.title}*… usually about 10–20 seconds.`
   );
 
   try {
@@ -832,7 +836,7 @@ async function handleHummingAudio(to, mediaId) {
     return;
   }
 
-  await sendText(to, 'Listening to your voice note… usually a few seconds.');
+  await sendText(to, 'Checking your voice note… usually a few seconds.');
 
   try {
     const media = await downloadWhatsAppMedia(mediaId);
@@ -846,7 +850,7 @@ async function handleHummingAudio(to, mediaId) {
     if (!song.matched) {
       await sendText(to, formatHummingNoMatch(), { previewUrl: false });
     } else {
-      await sendText(to, formatSongMessage('Humming', data), {
+      await sendText(to, formatSongMessage('Hum or detect', data), {
         previewUrl: Boolean(song.shazam_url),
       });
     }
