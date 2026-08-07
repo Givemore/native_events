@@ -896,12 +896,12 @@ async function sendResultActions(to) {
     type: 'interactive',
     interactive: {
       type: 'button',
-      body: { text: 'Tap an option below' },
+      body: { text: '🔄 Detect Again' },
       action: {
         buttons: [
           {
             type: 'reply',
-            reply: { id: ACTION_DETECT_AGAIN, title: '🔄 Detect Again' },
+            reply: { id: ACTION_DETECT_AGAIN, title: 'Detect Again' },
           },
         ],
       },
@@ -909,7 +909,7 @@ async function sendResultActions(to) {
   });
 }
 
-async function sendSongResult(to, stationTitle, data, { audioClip = null } = {}) {
+async function sendSongResult(to, stationTitle, data) {
   const song = data.song || {};
 
   if (!song.matched) {
@@ -929,22 +929,6 @@ async function sendSongResult(to, stationTitle, data, { audioClip = null } = {})
     }
   } else {
     await sendText(to, card, { previewUrl: false });
-  }
-
-  // Song sample from the live stream
-  if (Buffer.isBuffer(audioClip) && audioClip.length >= 500) {
-    try {
-      await sendStreamClip(to, audioClip);
-      await logUsage({
-        event: 'clip',
-        user_id: to,
-        phone: to,
-        station: stationTitle,
-        meta: { seconds: sampleSeconds, bytes: audioClip.length },
-      });
-    } catch (clipErr) {
-      console.warn('Stream clip send failed:', clipErr.message || clipErr);
-    }
   }
 
   await sendResultActions(to);
@@ -1062,6 +1046,22 @@ async function handleIdentify(to, station) {
       }
     }
 
+    // Song sample right after the "Checking…" message
+    if (Buffer.isBuffer(clip) && clip.length >= 500) {
+      try {
+        await sendStreamClip(to, clip);
+        await logUsage({
+          event: 'clip',
+          user_id: to,
+          phone: to,
+          station: station.title,
+          meta: { seconds: sampleSeconds, bytes: clip.length },
+        });
+      } catch (clipErr) {
+        console.warn('Stream clip send failed:', clipErr.message || clipErr);
+      }
+    }
+
     await logUsage({
       event: 'identify',
       user_id: to,
@@ -1072,7 +1072,7 @@ async function handleIdentify(to, station) {
       artist: song.artist || '',
       genres: song.genres || [],
     });
-    await sendSongResult(to, station.title, data, { audioClip: clip });
+    await sendSongResult(to, station.title, data);
 
     if (!song.matched) {
       await sendStationButtons(to);
