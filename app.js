@@ -986,38 +986,16 @@ function rememberMatch(to, stationTitle, song) {
   });
 }
 
-function formatDetectedAt(ts = Date.now()) {
-  return new Date(ts).toLocaleTimeString('en-US', {
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-    timeZone: 'Africa/Gaborone',
-  });
-}
-
-/** Cover first, then this compact card — no raw URLs. */
-function formatCompactSong(stationTitle, song, detectedAt = Date.now()) {
+/** Labeled card style (Title / Artist / Album / Genre) — no raw URLs. */
+function formatSongCard(stationTitle, song) {
   const lines = [
-    `🎵 *${song.title || 'Unknown title'}*`,
-    song.artist || 'Unknown artist',
+    `*${stationTitle}*`,
     '',
+    `*Title:* ${song.title || 'Unknown title'}`,
+    `*Artist:* ${song.artist || 'Unknown artist'}`,
   ];
-
-  if (song.album) lines.push(`💿 ${song.album}`);
-  if (song.genres?.length) lines.push(`🎶 ${song.genres.join(', ')}`);
-  lines.push(`📻 ${stationTitle}`);
-  lines.push('');
-  lines.push(`Detected at ${formatDetectedAt(detectedAt)}`);
-
-  const links = songListenLinks(song);
-  if (links.length) {
-    lines.push('');
-    lines.push('🎧 *Listen now*');
-    for (const { label } of links) {
-      lines.push(`• ${label}`);
-    }
-  }
-
+  if (song.album) lines.push(`*Album:* ${song.album}`);
+  if (song.genres?.length) lines.push(`*Genre:* ${song.genres.join(', ')}`);
   return lines.join('\n');
 }
 
@@ -1031,7 +1009,7 @@ function formatSongMessage(stationTitle, data) {
     );
   }
 
-  return formatCompactSong(stationTitle, song);
+  return formatSongCard(stationTitle, song);
 }
 
 async function sendResultActions(to) {
@@ -1131,21 +1109,21 @@ async function sendSongResult(to, stationTitle, data) {
   }
 
   rememberMatch(to, stationTitle, song);
-  const compact = formatCompactSong(stationTitle, song);
+  const card = formatSongCard(stationTitle, song);
   const cover = cleanHttpUrl(song.cover_art);
 
-  // 1) Artwork first (no caption clutter)
+  // Cover + labeled caption in one bubble (the style you liked)
   if (cover) {
-    const body = await sendImage(to, cover);
+    const body = await sendImage(to, cover, card);
     if (body?.error) {
       console.warn('Cover image send failed', body.error);
+      await sendText(to, card, { previewUrl: false });
     }
+  } else {
+    await sendText(to, card, { previewUrl: false });
   }
 
-  // 2) Compact details + platform names (no URLs)
-  await sendText(to, compact, { previewUrl: false });
-
-  // 3) Listen | Detect Again
+  // Links open via Listen — keeps the card clean (no long URLs)
   await sendResultActions(to);
 }
 
