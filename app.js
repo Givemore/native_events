@@ -1,4 +1,6 @@
 const express = require('express');
+const net = require('net');
+const tls = require('tls');
 
 const app = express();
 app.use(express.json());
@@ -11,6 +13,12 @@ const identifyApiUrl =
   process.env.IDENTIFY_API_URL || 'https://moeng.io/mvumba/api/identify.php';
 const webAppUrl = process.env.WEB_APP_URL || 'https://moeng.io/mvumba/';
 const captureProxySecret = process.env.CAPTURE_PROXY_SECRET || '';
+const rapidApiKey = process.env.RAPIDAPI_KEY || '';
+const rapidApiHost =
+  process.env.RAPIDAPI_HOST || 'shazam-core.p.rapidapi.com';
+const recognizeUrl =
+  process.env.RECOGNIZE_URL ||
+  'https://shazam-core.p.rapidapi.com/v1/tracks/recognize';
 const sampleSeconds = Math.min(
   15,
   Math.max(3, Number(process.env.SAMPLE_SECONDS) || 10)
@@ -104,57 +112,73 @@ async function sendStationButtons(to, name) {
   });
 }
 
-async function identifyStream(streamUrl) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45000);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  try {
-    const response = await fetch(identifyApiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stream_url: streamUrl }),
-      signal: controller.signal,
-    });
+/** Shoutcast/ICY may prepend status lines before MPEG frames. */
+function stripIcyPreamble(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) return buffer;
 
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || !data.ok) {
-      throw new Error(data.error || `Identify failed (${response.status})`);
-    }
-    return data;
-  } finally {
-    clearTimeout(timeout);
+  const head = buffer.subarray(0, Math.min(16, buffer.length)).toString('ascii');
+  if (!head.startsWith('ICY ') && !head.startsWith('HTTP/')) {
+    return buffer;
   }
+
+  for (let i = 0; i < buffer.length - 1; i++) {
+    // MPEG frame sync
+    if (buffer[i] === 0xff && (buffer[i + 1] & 0xe0) === 0xe0) {
+      return buffer.subarray(i);
+    }
+    // ID3 tag
+    if (
+      buffer[i] === 0x49 &&
+      buffer[i + 1] === 0x44 &&
+      i + 2 < buffer.length &&
+      buffer[i + 2] === 0x33
+    ) {
+      return buffer.subarray(i);
+    }
+  }
+  return buffer;
 }
 
 /**
- * Capture ~N seconds of a live stream. Used by the PHP app on shared hosting
- * that cannot open outbound connections to non-standard ports (Duma/Gabz).
+ * Capture ~N seconds of a live stream. Used by WhatsApp identify (local)
+ * and by the PHP app on shared hosting via /api/capture.
+ *
+ * Many Shoutcast servers reply with "ICY 200 OK" (HTTP/0.9). Node fetch
+ * rejects that, so we fall back to a raw TCP reader.
  */
 async function captureStreamAudio(streamUrl, seconds = sampleSeconds) {
+  try {
+    return await captureViaFetch(streamUrl, seconds);
+  } catch (fetchErr) {
+    console.warn('fetch capture failed, trying ICY socket:', fetchErr.message || fetchErr);
+    return captureViaIcySocket(streamUrl, seconds);
+  }
+}
+
+async function captureViaFetch(streamUrl, seconds = sampleSeconds) {
   const byteBudget = seconds * 20000;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), seconds * 1000 + 20000);
+  const timeout = setTimeout(() => controller.abort(), seconds * 1000 + 25000);
 
   try {
     const response = await fetch(streamUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; StreamShazam/1.0)',
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Icy-MetaData': '0',
-        Accept: 'audio/*,*/*',
+        Accept: '*/*',
+        Connection: 'close',
       },
       signal: controller.signal,
       redirect: 'follow',
     });
 
-    if (!response.ok && response.status !== 0) {
-      // Some shoutcast servers return odd statuses but still stream body
-      if (!response.body) {
-        throw new Error(`Stream HTTP ${response.status}`);
-      }
-    }
-
     if (!response.body) {
-      throw new Error('Stream returned no body');
+      throw new Error(`Stream returned no body (HTTP ${response.status})`);
     }
 
     const reader = response.body.getReader();
@@ -187,7 +211,261 @@ async function captureStreamAudio(streamUrl, seconds = sampleSeconds) {
       throw new Error(`Captured only ${written} bytes from stream`);
     }
 
-    return Buffer.concat(chunks, written);
+    return stripIcyPreamble(Buffer.concat(chunks, written));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function streamRequestPath(parsed, originalUrl) {
+  let path = parsed.pathname || '/';
+  if (parsed.search) path += parsed.search;
+  // Shoutcast often needs a trailing ";" (e.g. http://host:port/;)
+  if (originalUrl.includes('/;') && !path.includes(';')) {
+    path = path.endsWith('/') ? `${path};` : `${path}/;`;
+  }
+  return path || '/';
+}
+
+function captureViaIcySocket(streamUrl, seconds = sampleSeconds) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try {
+      parsed = new URL(streamUrl);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const isTls = parsed.protocol === 'https:';
+    const port = Number(parsed.port || (isTls ? 443 : 80));
+    const path = streamRequestPath(parsed, streamUrl);
+    const byteBudget = seconds * 20000;
+    const chunks = [];
+    let written = 0;
+    let settled = false;
+
+    const connectOpts = { host: parsed.hostname, port };
+    let socket;
+    const finish = (err, buffer) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket?.destroy();
+      } catch (_) {}
+      if (err) reject(err);
+      else resolve(buffer);
+    };
+
+    const onData = (chunk) => {
+      if (!Buffer.isBuffer(chunk) || chunk.length === 0) return;
+      const remaining = byteBudget - written;
+      if (remaining <= 0) {
+        finish(null, stripIcyPreamble(Buffer.concat(chunks, written)));
+        return;
+      }
+      if (chunk.length <= remaining) {
+        chunks.push(chunk);
+        written += chunk.length;
+      } else {
+        chunks.push(chunk.subarray(0, remaining));
+        written += remaining;
+      }
+      if (written >= byteBudget) {
+        finish(null, stripIcyPreamble(Buffer.concat(chunks, written)));
+      }
+    };
+
+    function onConnect() {
+      const hostHeader = parsed.port
+        ? `${parsed.hostname}:${parsed.port}`
+        : parsed.hostname;
+      socket.write(
+        `GET ${path} HTTP/1.0\r\n` +
+          `Host: ${hostHeader}\r\n` +
+          `User-Agent: Mozilla/5.0 (compatible; StreamShazam/1.0)\r\n` +
+          `Icy-MetaData: 0\r\n` +
+          `Accept: */*\r\n` +
+          `Connection: close\r\n` +
+          `\r\n`
+      );
+    }
+
+    socket = isTls
+      ? tls.connect({ ...connectOpts, servername: parsed.hostname }, onConnect)
+      : net.connect(connectOpts, onConnect);
+
+    socket.setTimeout(seconds * 1000 + 25000);
+    socket.on('data', onData);
+    socket.on('timeout', () => {
+      if (written >= 2000) {
+        finish(null, stripIcyPreamble(Buffer.concat(chunks, written)));
+      } else {
+        finish(new Error('ICY stream connection timed out'));
+      }
+    });
+    socket.on('error', (err) => finish(err));
+    socket.on('end', () => {
+      if (written >= 2000) {
+        finish(null, stripIcyPreamble(Buffer.concat(chunks, written)));
+      } else {
+        finish(new Error(`ICY stream ended early (${written} bytes)`));
+      }
+    });
+  });
+}
+
+async function captureWithRetries(streamUrl, seconds = sampleSeconds, attempts = 3) {
+  let lastError;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await captureStreamAudio(streamUrl, seconds);
+    } catch (err) {
+      lastError = err;
+      console.warn(`Capture attempt ${i}/${attempts} failed:`, err.message || err);
+      if (i < attempts) await sleep(800 * i);
+    }
+  }
+  throw lastError || new Error('Failed to capture stream');
+}
+
+function normalizeShazamResponse(data) {
+  if (!data || typeof data !== 'object') {
+    return { matched: false, title: null, artist: null, album: null, genres: [], shazam_url: null };
+  }
+
+  if (data.track == null && !data.title) {
+    return { matched: false, title: null, artist: null, album: null, genres: [], shazam_url: null };
+  }
+
+  const track = data.track && typeof data.track === 'object' ? data.track : data;
+  if (!track.title) {
+    return { matched: false, title: null, artist: null, album: null, genres: [], shazam_url: null };
+  }
+
+  const genres = [];
+  if (typeof track.genres?.primary === 'string') genres.push(track.genres.primary);
+
+  let album = null;
+  const sections = Array.isArray(track.sections) ? track.sections : [];
+  for (const section of sections) {
+    if (section?.type !== 'SONG' || !Array.isArray(section.metadata)) continue;
+    for (const meta of section.metadata) {
+      if (String(meta?.title || '').toLowerCase() === 'album' && typeof meta.text === 'string') {
+        album = meta.text;
+      }
+    }
+  }
+
+  return {
+    matched: true,
+    title: track.title || null,
+    artist: track.subtitle || null,
+    album,
+    genres,
+    shazam_url: typeof track.url === 'string' ? track.url : null,
+  };
+}
+
+async function recognizeWithShazam(audioBuffer) {
+  if (!rapidApiKey) {
+    throw new Error('RAPIDAPI_KEY is not configured on Render');
+  }
+
+  const form = new FormData();
+  form.append(
+    'file',
+    new Blob([audioBuffer], { type: 'audio/mpeg' }),
+    'sample.mp3'
+  );
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+
+  try {
+    const response = await fetch(recognizeUrl, {
+      method: 'POST',
+      headers: {
+        'x-rapidapi-key': rapidApiKey,
+        'x-rapidapi-host': rapidApiHost,
+      },
+      body: form,
+      signal: controller.signal,
+    });
+
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const message = body.message || body.error || `Shazam HTTP ${response.status}`;
+      throw new Error(typeof message === 'string' ? message : JSON.stringify(message));
+    }
+
+    return normalizeShazamResponse(body);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** Prefer local capture+Shazam on Render (reliable). PHP path is fallback only. */
+async function identifyStream(streamUrl) {
+  if (rapidApiKey) {
+    return identifyLocally(streamUrl);
+  }
+  console.warn('RAPIDAPI_KEY missing — falling back to PHP identify API');
+  return identifyViaPhp(streamUrl);
+}
+
+async function identifyLocally(streamUrl) {
+  let lastError = null;
+
+  // Up to 2 listen attempts — talk/ads often cause a no-match on the first try.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const audio = await captureWithRetries(streamUrl, sampleSeconds, 3);
+      const song = await recognizeWithShazam(audio);
+
+      if (song.matched || attempt === 2) {
+        return {
+          ok: true,
+          matched: Boolean(song.matched),
+          capture: {
+            method: 'render-local',
+            bytes: audio.length,
+            seconds: sampleSeconds,
+            attempt,
+          },
+          song,
+        };
+      }
+
+      console.log('No match on attempt 1 — sampling again');
+      await sleep(1500);
+    } catch (err) {
+      lastError = err;
+      console.error(`Identify attempt ${attempt} failed:`, err.message || err);
+      if (attempt < 2) await sleep(1200);
+    }
+  }
+
+  throw lastError || new Error('Identify failed');
+}
+
+async function identifyViaPhp(streamUrl) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+
+  try {
+    const response = await fetch(identifyApiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stream_url: streamUrl }),
+      signal: controller.signal,
+    });
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || `Identify failed (${response.status})`);
+    }
+    return data;
   } finally {
     clearTimeout(timeout);
   }
@@ -298,7 +576,7 @@ function formatIdentifyError(stationTitle, err) {
 async function handleIdentify(to, station) {
   await sendText(
     to,
-    `Listening to *${station.title}*… this takes about 10 seconds.`
+    `Listening to *${station.title}*… usually about 10–20 seconds.`
   );
 
   try {
@@ -385,6 +663,8 @@ app.get('/health', (_req, res) => {
     identifyApiUrl,
     webAppUrl,
     captureEndpoint: '/api/capture',
+    identifyMode: rapidApiKey ? 'render-local' : 'php-fallback',
+    rapidapiConfigured: Boolean(rapidApiKey),
     whatsappConfigured: Boolean(whatsappToken && phoneNumberId),
   });
 });
@@ -432,7 +712,7 @@ app.post('/api/capture', async (req, res) => {
   );
 
   try {
-    const audio = await captureStreamAudio(streamUrl, seconds);
+    const audio = await captureWithRetries(streamUrl, seconds, 3);
     res.set({
       'Content-Type': 'audio/mpeg',
       'Content-Length': String(audio.length),
@@ -467,5 +747,8 @@ app.post('/', (req, res) => {
 
 app.listen(port, () => {
   console.log(`StreamID WhatsApp bot listening on port ${port}`);
-  console.log(`Identify API: ${identifyApiUrl}`);
+  console.log(
+    `Identify mode: ${rapidApiKey ? 'render-local (capture+Shazam)' : 'php-fallback'}`
+  );
+  console.log(`Identify API (fallback): ${identifyApiUrl}`);
 });
