@@ -746,35 +746,6 @@ async function identifyViaPhp(streamUrl) {
   }
 }
 
-/** Prefer https links WhatsApp can open; drop intent:// and other app schemes. */
-function cleanHttpUrl(raw) {
-  if (!raw || typeof raw !== 'string') return null;
-  const value = raw.trim();
-  if (!value) return null;
-
-  // Android intent → https Apple Music URL
-  if (value.startsWith('intent://')) {
-    const path = value.slice('intent://'.length).split('#')[0];
-    if (path) return `https://${path}`;
-  }
-
-  // Spotify search URI → web search
-  if (value.startsWith('spotify:search:')) {
-    const q = value.slice('spotify:search:'.length);
-    try {
-      return `https://open.spotify.com/search/${decodeURIComponent(q)}`;
-    } catch (_) {
-      return `https://open.spotify.com/search/${q}`;
-    }
-  }
-
-  if (value.startsWith('https://') || value.startsWith('http://')) {
-    return value;
-  }
-
-  return null;
-}
-
 function formatSongMessage(stationTitle, data) {
   const song = data.song || {};
 
@@ -796,12 +767,7 @@ function formatSongMessage(stationTitle, data) {
   if (song.genres?.length) lines.push(`Genre: ${song.genres.join(', ')}`);
   if (typeof song.score === 'number') lines.push(`Confidence: ${song.score}%`);
 
-  // One clean link (WhatsApp shows a nice preview). Skip long/noisy extras.
-  const shazam = cleanHttpUrl(song.shazam_url);
-  if (shazam) {
-    lines.push('', shazam);
-  }
-
+  // Song details only — never surface Shazam (or other provider) links to the user.
   return lines.join('\n');
 }
 
@@ -944,7 +910,7 @@ async function handleIdentify(to, station) {
       genres: song.genres || [],
     });
     await sendText(to, formatSongMessage(station.title, data), {
-      previewUrl: Boolean(song.shazam_url && song.matched),
+      previewUrl: false,
     });
   } catch (err) {
     await logUsage({
@@ -997,7 +963,7 @@ async function handleHummingAudio(to, mediaId) {
       await sendText(to, formatHummingNoMatch(), { previewUrl: false });
     } else {
       await sendText(to, formatSongMessage('Hum or detect', data), {
-        previewUrl: Boolean(song.shazam_url),
+        previewUrl: false,
       });
     }
   } catch (err) {
