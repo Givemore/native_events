@@ -14,6 +14,10 @@ const identifyApiUrl =
   process.env.IDENTIFY_API_URL || 'https://moeng.io/mvumba/api/identify.php';
 const webAppUrl = process.env.WEB_APP_URL || 'https://moeng.io/mvumba/';
 const captureProxySecret = process.env.CAPTURE_PROXY_SECRET || '';
+const usageIngestUrl =
+  process.env.USAGE_INGEST_URL ||
+  `${webAppUrl.replace(/\/?$/, '/')}api/usage.php`;
+const usageIngestSecret = process.env.USAGE_INGEST_SECRET || '';
 const rapidApiKey = process.env.RAPIDAPI_KEY || '';
 const rapidApiHost =
   process.env.RAPIDAPI_HOST || 'shazam-core.p.rapidapi.com';
@@ -130,6 +134,26 @@ async function sendStationButtons(to, name) {
       },
     },
   });
+}
+
+async function logUsage(partial) {
+  if (!usageIngestUrl) return;
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (usageIngestSecret) {
+      headers['X-Usage-Secret'] = usageIngestSecret;
+    }
+    await fetch(usageIngestUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        channel: 'whatsapp',
+        ...partial,
+      }),
+    });
+  } catch (err) {
+    console.warn('Usage log failed:', err.message || err);
+  }
 }
 
 async function sendHumInstructions(to) {
@@ -814,11 +838,28 @@ async function handleIdentify(to, station) {
 
   try {
     const data = await identifyStream(station.streamUrl);
-    // Shazam link gets a nice preview card; keep that on.
+    const song = data.song || {};
+    await logUsage({
+      event: 'identify',
+      user_id: to,
+      phone: to,
+      station: station.title,
+      matched: Boolean(song.matched),
+      title: song.title || '',
+      artist: song.artist || '',
+      genres: song.genres || [],
+    });
     await sendText(to, formatSongMessage(station.title, data), {
-      previewUrl: Boolean(data?.song?.shazam_url && data?.song?.matched),
+      previewUrl: Boolean(song.shazam_url && song.matched),
     });
   } catch (err) {
+    await logUsage({
+      event: 'error',
+      user_id: to,
+      phone: to,
+      station: station.title,
+      error: String(err?.message || err || 'identify failed'),
+    });
     await sendText(to, formatIdentifyError(station.title, err), {
       previewUrl: false,
     });
@@ -847,6 +888,17 @@ async function handleHummingAudio(to, mediaId) {
       song,
     };
 
+    await logUsage({
+      event: 'hum',
+      user_id: to,
+      phone: to,
+      station: 'Hum or detect',
+      matched: Boolean(song.matched),
+      title: song.title || '',
+      artist: song.artist || '',
+      genres: song.genres || [],
+    });
+
     if (!song.matched) {
       await sendText(to, formatHummingNoMatch(), { previewUrl: false });
     } else {
@@ -855,6 +907,13 @@ async function handleHummingAudio(to, mediaId) {
       });
     }
   } catch (err) {
+    await logUsage({
+      event: 'error',
+      user_id: to,
+      phone: to,
+      station: 'Hum or detect',
+      error: String(err?.message || err || 'hum failed'),
+    });
     await sendText(to, formatHummingError(err), { previewUrl: false });
   }
 
@@ -888,6 +947,13 @@ function extractIncomingMessages(body) {
 
 async function handleMessage(msg) {
   if (msg.buttonId === ACTION_HUM) {
+    await logUsage({
+      event: 'menu',
+      user_id: msg.from,
+      phone: msg.from,
+      name: msg.name || '',
+      meta: { action: 'hum' },
+    });
     await sendHumInstructions(msg.from);
     return;
   }
@@ -926,6 +992,13 @@ async function handleMessage(msg) {
       await handleIdentify(msg.from, named);
       return;
     }
+
+    await logUsage({
+      event: 'menu',
+      user_id: msg.from,
+      phone: msg.from,
+      name: msg.name || '',
+    });
     await sendStationButtons(msg.from, msg.name);
   }
 }
@@ -951,12 +1024,14 @@ app.get('/health', (_req, res) => {
     ok: true,
     identifyApiUrl,
     webAppUrl,
+    usageIngestUrl,
     captureEndpoint: '/api/capture',
     identifyMode: rapidApiKey ? 'render-local' : 'php-fallback',
     rapidapiConfigured: Boolean(rapidApiKey),
     acrcloudConfigured: acrCloudConfigured(),
     acrcloudHost: acrHost,
     whatsappConfigured: Boolean(whatsappToken && phoneNumberId),
+    usageLoggingConfigured: Boolean(usageIngestUrl),
   });
 });
 
