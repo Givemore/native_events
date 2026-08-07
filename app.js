@@ -119,7 +119,7 @@ async function sendStationButtons(to, name) {
             rows: [
               {
                 id: ACTION_HUM,
-                title: 'Hum a song',
+                title: 'Hum or detect a song',
                 description: 'Then send a voice note (10–15s)',
               },
             ],
@@ -133,9 +133,9 @@ async function sendStationButtons(to, name) {
 async function sendHumInstructions(to) {
   return sendText(
     to,
-    '🎵 *Hum a song*\n\n' +
-      'Record a voice note humming or singing the melody for about *10–15 seconds*, then send it.\n\n' +
-      'Tip: hum clearly, one tune at a time — works best without background noise.',
+    '🎵 *Hum or detect a song*\n\n' +
+      'Record a voice note humming/singing the melody, or playing a song nearby, for about *10–15 seconds*, then send it.\n\n' +
+      'Tip: keep it clear, one tune at a time — works best without background noise.',
     { previewUrl: false }
   );
 }
@@ -770,6 +770,22 @@ function formatHummingError(err) {
     return (
       `🎵 *Humming*\n\n` +
       `Humming isn’t set up yet on the server. Please try again later.`
+    );
+  }
+
+  const msg = String(err?.message || err || '').toLowerCase();
+  if (
+    msg.includes('access') ||
+    msg.includes('signature') ||
+    msg.includes('unauthorized') ||
+    msg.includes('invalid key') ||
+    msg.includes('permission') ||
+    msg.includes('status 20') ||
+    msg.includes('status 30')
+  ) {
+    return (
+      `🎵 *Humming*\n\n` +
+      `ACRCloud rejected the credentials. Use the *project* Access Key + Access Secret from your AVR humming project (not Old Access Keys / Personal Access Token), then redeploy.`
     );
   }
 
