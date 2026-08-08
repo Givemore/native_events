@@ -34,7 +34,6 @@ const sampleSeconds = Math.min(
 );
 
 const ACTION_HUM = 'action_hum';
-const ACTION_DETECT_AGAIN = 'action_detect_again';
 
 // Botswana stations — button titles must be ≤ 20 chars (WhatsApp limit)
 const STATIONS = {
@@ -150,11 +149,16 @@ async function sendImage(to, imageUrl, caption = '') {
 }
 
 /** Upload a ~10s stream snap and send it as a playable WhatsApp audio message. */
-async function sendStreamClip(to, audioBuffer) {
+async function sendStreamClip(to, audioBuffer, stationTitle) {
   const mediaId = await uploadWhatsAppMedia(
     audioBuffer,
     'audio/mpeg',
     'stream-clip.mp3'
+  );
+  await sendText(
+    to,
+    `*${stationTitle}* — here’s ~${sampleSeconds}s of what’s on air:`,
+    { previewUrl: false }
   );
   return sendAudio(to, mediaId, { voice: false });
 }
@@ -890,25 +894,6 @@ function formatSongMessage(stationTitle, data) {
   return formatSongCard(stationTitle, song);
 }
 
-async function sendResultActions(to) {
-  return sendWhatsApp({
-    to,
-    type: 'interactive',
-    interactive: {
-      type: 'button',
-      body: { text: '🔄 Detect Again' },
-      action: {
-        buttons: [
-          {
-            type: 'reply',
-            reply: { id: ACTION_DETECT_AGAIN, title: 'Detect Again' },
-          },
-        ],
-      },
-    },
-  });
-}
-
 async function sendSongResult(to, stationTitle, data) {
   const song = data.song || {};
 
@@ -931,7 +916,7 @@ async function sendSongResult(to, stationTitle, data) {
     await sendText(to, card, { previewUrl: false });
   }
 
-  await sendResultActions(to);
+  await sendStationButtons(to);
 }
 
 function formatHummingNoMatch() {
@@ -1049,7 +1034,7 @@ async function handleIdentify(to, station) {
     // Song sample right after the "Checking…" message
     if (Buffer.isBuffer(clip) && clip.length >= 500) {
       try {
-        await sendStreamClip(to, clip);
+        await sendStreamClip(to, clip, station.title);
         await logUsage({
           event: 'clip',
           user_id: to,
@@ -1177,11 +1162,6 @@ async function handleMessage(msg) {
       meta: { action: 'hum' },
     });
     await sendHumInstructions(msg.from);
-    return;
-  }
-
-  if (msg.buttonId === ACTION_DETECT_AGAIN) {
-    await sendStationButtons(msg.from, msg.name);
     return;
   }
 
