@@ -104,8 +104,9 @@ async function uploadWhatsAppMedia(buffer, mimeType = 'audio/mpeg', filename = '
   if (!whatsappToken || !phoneNumberId) {
     throw new Error('Missing WHATSAPP_TOKEN or PHONE_NUMBER_ID');
   }
-  if (!Buffer.isBuffer(buffer) || buffer.length < 500) {
-    throw new Error(`Audio clip too small (${buffer?.length || 0} bytes)`);
+  const minBytes = mimeType.startsWith('image/') ? 100 : 500;
+  if (!Buffer.isBuffer(buffer) || buffer.length < minBytes) {
+    throw new Error(`Media too small (${buffer?.length || 0} bytes)`);
   }
 
   const form = new FormData();
@@ -137,15 +138,46 @@ async function sendAudio(to, mediaId, { voice = false } = {}) {
 }
 
 async function sendImage(to, imageUrl, caption = '') {
-  const image = { link: imageUrl };
-  if (caption) {
-    image.caption = String(caption).slice(0, 1024);
+  const captionText = caption ? String(caption).slice(0, 1024) : '';
+
+  // Upload first so WhatsApp delivers the image before later messages (link
+  // images often arrive out of order and push the menu above the cover).
+  try {
+    const response = await fetch(imageUrl, {
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!response.ok) {
+      throw new Error(`Cover fetch HTTP ${response.status}`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const contentType = (response.headers.get('content-type') || '').split(';')[0].trim();
+    const mimeType =
+      contentType.startsWith('image/') ? contentType : 'image/jpeg';
+    const ext = mimeType.includes('png')
+      ? 'png'
+      : mimeType.includes('webp')
+        ? 'webp'
+        : 'jpg';
+    const mediaId = await uploadWhatsAppMedia(buffer, mimeType, `cover.${ext}`);
+    return sendWhatsApp({
+      to,
+      type: 'image',
+      image: {
+        id: mediaId,
+        ...(captionText ? { caption: captionText } : {}),
+      },
+    });
+  } catch (err) {
+    console.warn('Cover upload failed, falling back to link:', err.message || err);
+    return sendWhatsApp({
+      to,
+      type: 'image',
+      image: {
+        link: imageUrl,
+        ...(captionText ? { caption: captionText } : {}),
+      },
+    });
   }
-  return sendWhatsApp({
-    to,
-    type: 'image',
-    image,
-  });
 }
 
 /** Upload a ~10s stream snap and send it as a playable WhatsApp audio message. */
@@ -905,7 +937,7 @@ async function sendSongResult(to, stationTitle, data) {
   const card = formatSongCard(stationTitle, song);
   const cover = cleanHttpUrl(song.cover_art);
 
-  // Cover + details in one bubble
+  // Cover + details in one bubble (menu is sent afterwards by the caller)
   if (cover) {
     const body = await sendImage(to, cover, card);
     if (body?.error) {
@@ -915,8 +947,6 @@ async function sendSongResult(to, stationTitle, data) {
   } else {
     await sendText(to, card, { previewUrl: false });
   }
-
-  await sendStationButtons(to);
 }
 
 function formatHummingNoMatch() {
@@ -1059,9 +1089,8 @@ async function handleIdentify(to, station) {
     });
     await sendSongResult(to, station.title, data);
 
-    if (!song.matched) {
-      await sendStationButtons(to);
-    }
+    // Menu always last — after checking, sample, and cover
+    await sendStationButtons(to);
   } catch (err) {
     await logUsage({
       event: 'error',
@@ -1110,10 +1139,10 @@ async function handleHummingAudio(to, mediaId) {
 
     if (!song.matched) {
       await sendText(to, formatHummingNoMatch(), { previewUrl: false });
-      await sendStationButtons(to);
     } else {
       await sendSongResult(to, 'Hum or detect', data);
     }
+    await sendStationButtons(to);
   } catch (err) {
     await logUsage({
       event: 'error',
