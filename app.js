@@ -47,11 +47,6 @@ const STATIONS = {
     title: 'Duma FM',
     streamUrl: 'http://s3.voscast.com:10076/stream',
   },
-  gabz: {
-    id: 'station_gabz',
-    title: 'Gabz FM',
-    streamUrl: 'http://fmt01.egihosting.com:17721/;',
-  },
 };
 
 const STATION_BY_ID = Object.fromEntries(
