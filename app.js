@@ -88,6 +88,10 @@ async function sendWhatsApp(payload) {
   return body;
 }
 
+function whatsappMessageId(body) {
+  return body?.messages?.[0]?.id || null;
+}
+
 async function sendText(to, text, { previewUrl = true } = {}) {
   return sendWhatsApp({
     to,
@@ -195,9 +199,9 @@ async function sendStreamClip(to, audioBuffer, stationTitle) {
   return sendAudio(to, mediaId, { voice: false });
 }
 
-async function sendStationButtons(to, name) {
+async function sendStationButtons(to, name, { replyTo = null } = {}) {
   const greeting = name ? `Hi ${name}! ` : '';
-  return sendWhatsApp({
+  const payload = {
     to,
     type: 'interactive',
     interactive: {
@@ -232,7 +236,14 @@ async function sendStationButtons(to, name) {
         ],
       },
     },
-  });
+  };
+
+  // Reply-to keeps the menu threaded under the cover in WhatsApp’s timeline
+  if (replyTo) {
+    payload.context = { message_id: replyTo };
+  }
+
+  return sendWhatsApp(payload);
 }
 
 async function logUsage(partial) {
@@ -930,23 +941,34 @@ async function sendSongResult(to, stationTitle, data) {
   const song = data.song || {};
 
   if (!song.matched) {
-    await sendText(to, formatSongMessage(stationTitle, data), { previewUrl: false });
-    return;
+    const body = await sendText(to, formatSongMessage(stationTitle, data), {
+      previewUrl: false,
+    });
+    return whatsappMessageId(body);
   }
 
   const card = formatSongCard(stationTitle, song);
   const cover = cleanHttpUrl(song.cover_art);
 
-  // Cover + details in one bubble (menu is sent afterwards by the caller)
+  // Cover + details first. Caller sends the menu after a settle delay.
   if (cover) {
     const body = await sendImage(to, cover, card);
     if (body?.error) {
       console.warn('Cover image send failed', body.error);
-      await sendText(to, card, { previewUrl: false });
+      const fallback = await sendText(to, card, { previewUrl: false });
+      return whatsappMessageId(fallback);
     }
-  } else {
-    await sendText(to, card, { previewUrl: false });
+    return whatsappMessageId(body);
   }
+
+  const body = await sendText(to, card, { previewUrl: false });
+  return whatsappMessageId(body);
+}
+
+/** Menu must wait — WhatsApp often shows interactive msgs before images settle. */
+async function sendMenuAfterResult(to, name, replyTo = null) {
+  await sleep(2500);
+  return sendStationButtons(to, name, { replyTo });
 }
 
 function formatHummingNoMatch() {
@@ -1087,10 +1109,10 @@ async function handleIdentify(to, station) {
       artist: song.artist || '',
       genres: song.genres || [],
     });
-    await sendSongResult(to, station.title, data);
+    const resultId = await sendSongResult(to, station.title, data);
 
     // Menu always last — after checking, sample, and cover
-    await sendStationButtons(to);
+    await sendMenuAfterResult(to, undefined, resultId);
   } catch (err) {
     await logUsage({
       event: 'error',
@@ -1139,10 +1161,11 @@ async function handleHummingAudio(to, mediaId) {
 
     if (!song.matched) {
       await sendText(to, formatHummingNoMatch(), { previewUrl: false });
+      await sendStationButtons(to);
     } else {
-      await sendSongResult(to, 'Hum or detect', data);
+      const resultId = await sendSongResult(to, 'Hum or detect', data);
+      await sendMenuAfterResult(to, undefined, resultId);
     }
-    await sendStationButtons(to);
   } catch (err) {
     await logUsage({
       event: 'error',
