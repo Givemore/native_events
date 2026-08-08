@@ -182,16 +182,30 @@ async function sendImage(to, imageUrl, caption = '') {
 
 /** Upload a ~10s stream snap and send it as a playable WhatsApp audio message. */
 async function sendStreamClip(to, audioBuffer, stationTitle) {
-  const mediaId = await uploadWhatsAppMedia(
-    audioBuffer,
-    'audio/mpeg',
-    'stream-clip.mp3'
-  );
+  const clip = stripIcyPreamble(audioBuffer);
+  if (!Buffer.isBuffer(clip) || clip.length < 500) {
+    throw new Error(`Stream clip too small after cleanup (${clip?.length || 0} bytes)`);
+  }
+
+  // Detect AAC ADTS (layer bits 00) vs MP3 so WhatsApp gets the right mime type
+  let mimeType = 'audio/mpeg';
+  let filename = 'stream-clip.mp3';
+  for (let i = 0; i < Math.min(clip.length - 1, 64); i++) {
+    if (clip[i] !== 0xff || (clip[i + 1] & 0xf0) !== 0xf0) continue;
+    if ((clip[i + 1] & 0x06) === 0x00) {
+      mimeType = 'audio/aac';
+      filename = 'stream-clip.aac';
+    }
+    break;
+  }
+
   await sendText(
     to,
     `*${stationTitle}* — here’s ~${sampleSeconds}s of what’s on air:`,
     { previewUrl: false }
   );
+
+  const mediaId = await uploadWhatsAppMedia(clip, mimeType, filename);
   return sendAudio(to, mediaId, { voice: false });
 }
 
@@ -287,13 +301,18 @@ function stripIcyPreamble(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 4) return buffer;
 
   const head = buffer.subarray(0, Math.min(16, buffer.length)).toString('ascii');
-  if (!head.startsWith('ICY ') && !head.startsWith('HTTP/')) {
-    return buffer;
-  }
+  const hasHttpPreamble = head.startsWith('ICY ') || head.startsWith('HTTP/');
 
-  for (let i = 0; i < buffer.length - 1; i++) {
-    // MPEG frame sync
-    if (buffer[i] === 0xff && (buffer[i + 1] & 0xe0) === 0xe0) {
+  // Prefer a real MPEG frame sync (12 ones). A loose 0xFFE0 check can false-match
+  // mid-stream noise — Gabz FM was getting invalid audio that WhatsApp silently drops.
+  const isMpegSync = (buf, i) =>
+    buf[i] === 0xff &&
+    (buf[i + 1] & 0xf0) === 0xf0 &&
+    (buf[i + 1] & 0x06) !== 0x00; // layer bits must not be "reserved" (AAC ADTS / junk)
+
+  const startAt = hasHttpPreamble ? 0 : 0;
+  for (let i = startAt; i < buffer.length - 1; i++) {
+    if (isMpegSync(buffer, i)) {
       return buffer.subarray(i);
     }
     // ID3 tag
@@ -306,7 +325,33 @@ function stripIcyPreamble(buffer) {
       return buffer.subarray(i);
     }
   }
+
+  // Last resort: older 11-bit sync (still exclude reserved layer)
+  for (let i = 0; i < buffer.length - 1; i++) {
+    if (
+      buffer[i] === 0xff &&
+      (buffer[i + 1] & 0xe0) === 0xe0 &&
+      (buffer[i + 1] & 0x06) !== 0x00
+    ) {
+      return buffer.subarray(i);
+    }
+  }
+
   return buffer;
+}
+
+function looksLikeShoutcastUrl(streamUrl) {
+  try {
+    const u = new URL(streamUrl);
+    const port = Number(u.port || 0);
+    return (
+      streamUrl.includes('/;') ||
+      streamUrl.includes(';') ||
+      (port > 0 && port !== 80 && port !== 443)
+    );
+  } catch (_) {
+    return false;
+  }
 }
 
 /**
@@ -314,9 +359,18 @@ function stripIcyPreamble(buffer) {
  * and by the PHP app on shared hosting via /api/capture.
  *
  * Many Shoutcast servers reply with "ICY 200 OK" (HTTP/0.9). Node fetch
- * rejects that, so we fall back to a raw TCP reader.
+ * rejects that, so we use a raw TCP reader (preferred for Gabz-style URLs).
  */
 async function captureStreamAudio(streamUrl, seconds = sampleSeconds) {
+  if (looksLikeShoutcastUrl(streamUrl)) {
+    try {
+      return await captureViaIcySocket(streamUrl, seconds);
+    } catch (icyErr) {
+      console.warn('ICY capture failed, trying fetch:', icyErr.message || icyErr);
+      return captureViaFetch(streamUrl, seconds);
+    }
+  }
+
   try {
     return await captureViaFetch(streamUrl, seconds);
   } catch (fetchErr) {
