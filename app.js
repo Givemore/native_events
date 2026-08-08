@@ -158,15 +158,7 @@ async function sendImage(to, imageUrl, caption = '') {
       : mimeType.includes('webp')
         ? 'webp'
         : 'jpg';
-    const mediaId = await uploadWhatsAppMedia(buffer, mimeType, `cover.${ext}`);
-    return sendWhatsApp({
-      to,
-      type: 'image',
-      image: {
-        id: mediaId,
-        ...(captionText ? { caption: captionText } : {}),
-      },
-    });
+    return sendImageBuffer(to, buffer, mimeType, `cover.${ext}`, captionText);
   } catch (err) {
     console.warn('Cover upload failed, falling back to link:', err.message || err);
     return sendWhatsApp({
@@ -178,6 +170,20 @@ async function sendImage(to, imageUrl, caption = '') {
       },
     });
   }
+}
+
+/** Upload a local image buffer to WhatsApp media and send it (rides WhatsApp CDN). */
+async function sendImageBuffer(to, buffer, mimeType, filename, caption = '') {
+  const captionText = caption ? String(caption).slice(0, 1024) : '';
+  const mediaId = await uploadWhatsAppMedia(buffer, mimeType, filename);
+  return sendWhatsApp({
+    to,
+    type: 'image',
+    image: {
+      id: mediaId,
+      ...(captionText ? { caption: captionText } : {}),
+    },
+  });
 }
 
 /** Upload a ~10s stream snap and send it as a playable WhatsApp audio message. */
@@ -1064,6 +1070,39 @@ function cleanHttpUrl(raw) {
   return null;
 }
 
+/** Sample soft promo shown after a successful match (toggle / swap creative later). */
+const SOFT_PROMO = {
+  enabled: true,
+  // Settle so the song card lands before the sponsor tip
+  delayMs: 1200,
+  // Server fetches this, uploads to WhatsApp — user gets it on WhatsApp/social data
+  imageUrl:
+    'https://mascom.bw/wp-content/uploads/2025/11/mysurf_inner_banner.jpg',
+  // Short caption — shop CTA (no website required for the user)
+  caption: [
+    '_Sponsored · Mascom MySurf_',
+    'Affordable internet from P395 — visit your nearest Mascom shop',
+  ].join('\n'),
+};
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendSoftPromo(to) {
+  if (!SOFT_PROMO.enabled || !SOFT_PROMO.imageUrl) return;
+  if (SOFT_PROMO.delayMs > 0) await sleep(SOFT_PROMO.delayMs);
+
+  try {
+    const body = await sendImage(to, SOFT_PROMO.imageUrl, SOFT_PROMO.caption || '');
+    if (body?.error) {
+      console.warn('Soft promo image failed', body.error);
+    }
+  } catch (err) {
+    console.warn('Soft promo image failed:', err.message || err);
+  }
+}
+
 /** Labeled card — no links; nudge users to search on their preferred app. */
 function formatSongCard(stationTitle, song) {
   const lines = [
@@ -1110,7 +1149,7 @@ async function sendSongResult(to, stationTitle, data) {
   const card = formatSongCard(stationTitle, song);
   const cover = cleanHttpUrl(song.cover_art);
 
-  // Cover + details first. Caller sends the menu after a settle delay.
+  // Cover + details first. Soft promo, then caller sends the station menu.
   if (cover) {
     const body = await sendImage(to, cover, card);
     if (body?.error) {
@@ -1120,6 +1159,8 @@ async function sendSongResult(to, stationTitle, data) {
   } else {
     await sendText(to, card, { previewUrl: false });
   }
+
+  await sendSoftPromo(to);
 }
 
 
