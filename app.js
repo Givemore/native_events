@@ -684,8 +684,15 @@ function normalizeAcrCloudResponse(data) {
     ? track.genres.map((g) => g?.name).filter(Boolean)
     : [];
 
-  const spotifyId = track.external_metadata?.spotify?.track?.id;
-  const youtubeId = track.external_metadata?.youtube?.vid;
+  const spotifyMeta = track.external_metadata?.spotify;
+  const spotifyId =
+    spotifyMeta?.track?.id ||
+    (Array.isArray(spotifyMeta) ? spotifyMeta[0]?.track?.id : null);
+  const youtubeId =
+    track.external_metadata?.youtube?.vid ||
+    (Array.isArray(track.external_metadata?.youtube)
+      ? track.external_metadata.youtube[0]?.vid
+      : null);
   const spotifyUrl = spotifyId
     ? `https://open.spotify.com/track/${spotifyId}`
     : null;
@@ -693,9 +700,18 @@ function normalizeAcrCloudResponse(data) {
     ? `https://youtu.be/${youtubeId}`
     : null;
 
+  const appleMeta = Array.isArray(track.external_metadata?.applemusic)
+    ? track.external_metadata.applemusic[0]
+    : track.external_metadata?.applemusic;
+  const appleUrl =
+    (typeof appleMeta?.link === 'string' && appleMeta.link) || null;
+
   const cover =
     (typeof track.album?.cover === 'string' && track.album.cover) ||
+    (typeof track.album?.covers?.large === 'string' && track.album.covers.large) ||
+    (typeof track.album?.covers?.medium === 'string' && track.album.covers.medium) ||
     (typeof track.album?.cover_art === 'string' && track.album.cover_art) ||
+    (typeof appleMeta?.album?.cover === 'string' && appleMeta.album.cover) ||
     null;
 
   return {
@@ -706,11 +722,58 @@ function normalizeAcrCloudResponse(data) {
     genres,
     cover_art: cover,
     shazam_url: null,
-    apple_music_url: null,
+    apple_music_url: appleUrl,
     spotify_url: spotifyUrl,
     youtube_url: youtubeUrl,
     score: typeof track.score === 'number' ? track.score : null,
   };
+}
+
+/** Humming matches often omit artwork — fill from Spotify/iTunes when needed. */
+async function enrichSongCover(song) {
+  if (!song?.matched || cleanHttpUrl(song.cover_art)) return song;
+
+  // Spotify oEmbed thumbnail
+  if (song.spotify_url) {
+    try {
+      const res = await fetch(
+        `https://open.spotify.com/oembed?url=${encodeURIComponent(song.spotify_url)}`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        if (typeof data.thumbnail_url === 'string' && data.thumbnail_url) {
+          song.cover_art = data.thumbnail_url;
+          return song;
+        }
+      }
+    } catch (err) {
+      console.warn('Spotify cover lookup failed:', err.message || err);
+    }
+  }
+
+  // Free iTunes Search artwork
+  const q = [song.artist, song.title].filter(Boolean).join(' ').trim();
+  if (q) {
+    try {
+      const res = await fetch(
+        `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&entity=song&limit=1`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const art = data.results?.[0]?.artworkUrl100;
+        if (typeof art === 'string' && art) {
+          song.cover_art = art.replace('100x100bb', '600x600bb');
+          return song;
+        }
+      }
+    } catch (err) {
+      console.warn('iTunes cover lookup failed:', err.message || err);
+    }
+  }
+
+  return song;
 }
 
 async function recognizeWithAcrCloud(audioBuffer, filename = 'sample.ogg') {
@@ -767,7 +830,7 @@ async function recognizeWithAcrCloud(audioBuffer, filename = 'sample.ogg') {
       throw new Error(typeof message === 'string' ? message : JSON.stringify(message));
     }
 
-    return normalizeAcrCloudResponse(body);
+    return enrichSongCover(normalizeAcrCloudResponse(body));
   } finally {
     clearTimeout(timeout);
   }
@@ -927,7 +990,8 @@ function formatSongMessage(stationTitle, data) {
 }
 
 async function sendSongResult(to, stationTitle, data) {
-  const song = data.song || {};
+  const song = await enrichSongCover(data.song || {});
+  data.song = song;
 
   if (!song.matched) {
     await sendText(to, formatSongMessage(stationTitle, data), {
@@ -951,11 +1015,7 @@ async function sendSongResult(to, stationTitle, data) {
   }
 }
 
-/** Menu must wait — WhatsApp often shows interactive msgs before images settle. */
-async function sendMenuAfterResult(to, name) {
-  await sleep(2500);
-  return sendStationButtons(to, name);
-}
+
 
 function formatHummingNoMatch() {
   return (
@@ -1097,8 +1157,7 @@ async function handleIdentify(to, station) {
     });
     await sendSongResult(to, station.title, data);
 
-    // Menu always last — after checking, sample, and cover
-    await sendMenuAfterResult(to);
+    await sendStationButtons(to);
   } catch (err) {
     await logUsage({
       event: 'error',
@@ -1150,7 +1209,7 @@ async function handleHummingAudio(to, mediaId) {
       await sendStationButtons(to);
     } else {
       await sendSongResult(to, 'Hum or detect', data);
-      await sendMenuAfterResult(to);
+      await sendStationButtons(to);
     }
   } catch (err) {
     await logUsage({
