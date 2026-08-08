@@ -1,4 +1,6 @@
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const net = require('net');
 const tls = require('tls');
@@ -158,15 +160,7 @@ async function sendImage(to, imageUrl, caption = '') {
       : mimeType.includes('webp')
         ? 'webp'
         : 'jpg';
-    const mediaId = await uploadWhatsAppMedia(buffer, mimeType, `cover.${ext}`);
-    return sendWhatsApp({
-      to,
-      type: 'image',
-      image: {
-        id: mediaId,
-        ...(captionText ? { caption: captionText } : {}),
-      },
-    });
+    return sendImageBuffer(to, buffer, mimeType, `cover.${ext}`, captionText);
   } catch (err) {
     console.warn('Cover upload failed, falling back to link:', err.message || err);
     return sendWhatsApp({
@@ -178,6 +172,35 @@ async function sendImage(to, imageUrl, caption = '') {
       },
     });
   }
+}
+
+/** Upload a local image buffer to WhatsApp media and send it (rides WhatsApp CDN). */
+async function sendImageBuffer(to, buffer, mimeType, filename, caption = '') {
+  const captionText = caption ? String(caption).slice(0, 1024) : '';
+  const mediaId = await uploadWhatsAppMedia(buffer, mimeType, filename);
+  return sendWhatsApp({
+    to,
+    type: 'image',
+    image: {
+      id: mediaId,
+      ...(captionText ? { caption: captionText } : {}),
+    },
+  });
+}
+
+/** Upload a PDF/doc buffer and send as a WhatsApp document (opens in-app). */
+async function sendDocumentBuffer(to, buffer, mimeType, filename, caption = '') {
+  const captionText = caption ? String(caption).slice(0, 1024) : '';
+  const mediaId = await uploadWhatsAppMedia(buffer, mimeType, filename);
+  return sendWhatsApp({
+    to,
+    type: 'document',
+    document: {
+      id: mediaId,
+      filename: filename || 'document.pdf',
+      ...(captionText ? { caption: captionText } : {}),
+    },
+  });
 }
 
 /** Upload a ~10s stream snap and send it as a playable WhatsApp audio message. */
@@ -1064,6 +1087,192 @@ function cleanHttpUrl(raw) {
   return null;
 }
 
+/** Soft promos after a successful match — throttled so they don’t show every time. */
+const SOFT_PROMO = {
+  enabled: true,
+  // Settle so the song card lands before the sponsor tip
+  delayMs: 1200,
+  // Show on every Nth successful match per user (1 = every time)
+  everyNthMatch: 3,
+  // Also wait at least this long between promos for the same user
+  cooldownMs: 20 * 60 * 1000, // 20 minutes
+  creatives: [
+    {
+      id: 'mascom',
+      imageUrl:
+        'https://mascom.bw/wp-content/uploads/2025/11/mysurf_inner_banner.jpg',
+      caption: [
+        '_Sponsored · Mascom MySurf_',
+        'Affordable internet from P395 — visit your nearest Mascom shop',
+      ].join('\n'),
+    },
+    {
+      id: 'choppies',
+      imageUrl:
+        'https://choppies.co.bw/wp-content/uploads/2026/08/WhatsApp-Image-2026-08-04-at-13.37.21.jpeg',
+      caption: [
+        '_Sponsored · Choppies_',
+        'Super Combo Deal P379.99 — valid till 9 Aug at your nearest Choppies',
+      ].join('\n'),
+    },
+    {
+      id: 'pnp',
+      // Full leaflet as WhatsApp PDF document (all pages)
+      documentPath: path.join(__dirname, 'assets', 'promo', 'pnp-win-groceries.pdf'),
+      filename: 'PicknPay-Win-P1M-Groceries.pdf',
+      caption: [
+        '_Sponsored · Pick n Pay_',
+        'Win your share of P1 000 000 in groceries — swipe Smart Shopper. Valid till 9 Aug',
+      ].join('\n'),
+    },
+  ],
+};
+
+/** Per-user promo pacing (in-memory; resets on bot restart). */
+const softPromoState = new Map();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getSoftPromoState(to) {
+  const key = String(to || '');
+  let state = softPromoState.get(key);
+  if (!state) {
+    state = { matchCount: 0, lastShownAt: 0, lastCreativeId: null };
+    softPromoState.set(key, state);
+  }
+  return state;
+}
+
+/** Returns true when this user should see a promo on this successful match. */
+function shouldShowSoftPromo(to) {
+  const everyNth = Math.max(1, Number(SOFT_PROMO.everyNthMatch) || 1);
+  const cooldownMs = Math.max(0, Number(SOFT_PROMO.cooldownMs) || 0);
+  const state = getSoftPromoState(to);
+  state.matchCount += 1;
+
+  if (state.matchCount % everyNth !== 0) return false;
+  if (cooldownMs > 0 && Date.now() - state.lastShownAt < cooldownMs) {
+    return false;
+  }
+  return true;
+}
+
+function pickSoftPromoCreative(to) {
+  const list = (SOFT_PROMO.creatives || []).filter(
+    (c) => c?.imageUrl || c?.imagePath || c?.documentPath || c?.documentUrl
+  );
+  if (!list.length) return null;
+
+  const state = getSoftPromoState(to);
+  // Prefer a different creative than last time so the same ad doesn’t repeat
+  const pool =
+    list.length > 1
+      ? list.filter(
+          (c) =>
+            (c.id ||
+              c.imageUrl ||
+              c.imagePath ||
+              c.documentPath ||
+              c.documentUrl) !== state.lastCreativeId
+        )
+      : list;
+  const pick = pool[Math.floor(Math.random() * pool.length)];
+  return pick || list[0];
+}
+
+async function sendSoftPromo(to) {
+  if (!SOFT_PROMO.enabled) return;
+  if (!shouldShowSoftPromo(to)) return;
+
+  const creative = pickSoftPromoCreative(to);
+  if (!creative) return;
+  if (SOFT_PROMO.delayMs > 0) await sleep(SOFT_PROMO.delayMs);
+
+  try {
+    let body;
+    if (creative.documentPath || creative.documentUrl) {
+      body = await sendSoftPromoDocument(to, creative);
+    } else if (creative.imagePath) {
+      if (!fs.existsSync(creative.imagePath)) {
+        throw new Error(`Promo image missing: ${creative.imagePath}`);
+      }
+      const buffer = fs.readFileSync(creative.imagePath);
+      const ext = path.extname(creative.imagePath).toLowerCase();
+      const mimeType =
+        ext === '.png'
+          ? 'image/png'
+          : ext === '.webp'
+            ? 'image/webp'
+            : 'image/jpeg';
+      body = await sendImageBuffer(
+        to,
+        buffer,
+        mimeType,
+        path.basename(creative.imagePath),
+        creative.caption || ''
+      );
+    } else {
+      body = await sendImage(to, creative.imageUrl, creative.caption || '');
+    }
+    if (body?.error) {
+      console.warn('Soft promo send failed', body.error);
+      return;
+    }
+    const state = getSoftPromoState(to);
+    state.lastShownAt = Date.now();
+    state.lastCreativeId =
+      creative.id ||
+      creative.imageUrl ||
+      creative.imagePath ||
+      creative.documentPath ||
+      creative.documentUrl;
+  } catch (err) {
+    console.warn('Soft promo send failed:', err.message || err);
+  }
+}
+
+async function sendSoftPromoDocument(to, creative) {
+  const filename =
+    creative.filename ||
+    (creative.documentPath
+      ? path.basename(creative.documentPath)
+      : 'promo.pdf');
+  const caption = creative.caption || '';
+
+  if (creative.documentPath) {
+    if (!fs.existsSync(creative.documentPath)) {
+      throw new Error(`Promo PDF missing: ${creative.documentPath}`);
+    }
+    const buffer = fs.readFileSync(creative.documentPath);
+    return sendDocumentBuffer(
+      to,
+      buffer,
+      'application/pdf',
+      filename,
+      caption
+    );
+  }
+
+  // Fetch remote PDF, upload to WhatsApp so users get it on WhatsApp data
+  const response = await fetch(creative.documentUrl, {
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!response.ok) {
+    throw new Error(`Promo PDF fetch HTTP ${response.status}`);
+  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return sendDocumentBuffer(to, buffer, 'application/pdf', filename, caption);
+}
+
+/** ACRCloud score is typically 0–100; show as a clear percentage when present. */
+function formatConfidence(score) {
+  if (typeof score !== 'number' || !Number.isFinite(score)) return null;
+  const pct = Math.round(Math.max(0, Math.min(100, score)));
+  return `${pct}%`;
+}
+
 /** Labeled card — no links; nudge users to search on their preferred app. */
 function formatSongCard(stationTitle, song) {
   const lines = [
@@ -1074,6 +1283,8 @@ function formatSongCard(stationTitle, song) {
   ];
   if (song.album) lines.push(`*Album:* ${song.album}`);
   if (song.genres?.length) lines.push(`*Genre:* ${song.genres.join(', ')}`);
+  const confidence = formatConfidence(song.score);
+  if (confidence) lines.push(`*Confidence:* ${confidence}`);
 
   lines.push(
     '',
@@ -1110,7 +1321,7 @@ async function sendSongResult(to, stationTitle, data) {
   const card = formatSongCard(stationTitle, song);
   const cover = cleanHttpUrl(song.cover_art);
 
-  // Cover + details first. Caller sends the menu after a settle delay.
+  // Cover + details first. Soft promo, then caller sends the station menu.
   if (cover) {
     const body = await sendImage(to, cover, card);
     if (body?.error) {
@@ -1120,6 +1331,8 @@ async function sendSongResult(to, stationTitle, data) {
   } else {
     await sendText(to, card, { previewUrl: false });
   }
+
+  await sendSoftPromo(to);
 }
 
 
