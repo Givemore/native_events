@@ -47,6 +47,11 @@ const STATIONS = {
     title: 'Duma FM',
     streamUrl: 'http://s3.voscast.com:10076/stream',
   },
+  gabz: {
+    id: 'station_gabz',
+    title: 'Gabz FM',
+    streamUrl: 'http://fmt01.egihosting.com:17721/;',
+  },
 };
 
 const STATION_BY_ID = Object.fromEntries(
@@ -1100,6 +1105,8 @@ function isTechnicalError(err) {
     '503',
     '500',
     '401',
+    '429',
+    'quota',
     'curl',
     'ffmpeg',
     'abort',
@@ -1117,6 +1124,14 @@ function isTechnicalError(err) {
 
 function formatIdentifyError(stationTitle, err) {
   console.error('Identify error', err);
+
+  const msg = String(err?.message || err || '');
+  if (/429|quota|exceeded the monthly/i.test(msg)) {
+    return (
+      `*${stationTitle}*\n\n` +
+      `Song recognition is temporarily unavailable — the monthly API limit was reached. Please try again later.`
+    );
+  }
 
   if (isTechnicalError(err)) {
     return (
