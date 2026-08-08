@@ -300,22 +300,15 @@ function sleep(ms) {
 function stripIcyPreamble(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 4) return buffer;
 
-  const head = buffer.subarray(0, Math.min(16, buffer.length)).toString('ascii');
-  const hasHttpPreamble = head.startsWith('ICY ') || head.startsWith('HTTP/');
-
-  // Prefer a real MPEG frame sync (12 ones). A loose 0xFFE0 check can false-match
-  // mid-stream noise — Gabz FM was getting invalid audio that WhatsApp silently drops.
-  const isMpegSync = (buf, i) =>
+  // Layer III (MP3) only — avoids AAC ADTS, Layer I/II junk, and 0xFF padding
+  // that made Gabz clips invalid for WhatsApp / Shazam.
+  const isMp3Sync = (buf, i) =>
     buf[i] === 0xff &&
     (buf[i + 1] & 0xf0) === 0xf0 &&
-    (buf[i + 1] & 0x06) !== 0x00; // layer bits must not be "reserved" (AAC ADTS / junk)
+    (buf[i + 1] & 0x06) === 0x02;
 
-  const startAt = hasHttpPreamble ? 0 : 0;
-  for (let i = startAt; i < buffer.length - 1; i++) {
-    if (isMpegSync(buffer, i)) {
-      return buffer.subarray(i);
-    }
-    // ID3 tag
+  for (let i = 0; i < buffer.length - 1; i++) {
+    if (isMp3Sync(buffer, i)) return buffer.subarray(i);
     if (
       buffer[i] === 0x49 &&
       buffer[i + 1] === 0x44 &&
@@ -326,7 +319,7 @@ function stripIcyPreamble(buffer) {
     }
   }
 
-  // Last resort: older 11-bit sync (still exclude reserved layer)
+  // Fallback: any MPEG layer except reserved
   for (let i = 0; i < buffer.length - 1; i++) {
     if (
       buffer[i] === 0xff &&
@@ -340,18 +333,9 @@ function stripIcyPreamble(buffer) {
   return buffer;
 }
 
+/** Classic Shoutcast mount that Node fetch can't parse (ICY 200 OK). */
 function looksLikeShoutcastUrl(streamUrl) {
-  try {
-    const u = new URL(streamUrl);
-    const port = Number(u.port || 0);
-    return (
-      streamUrl.includes('/;') ||
-      streamUrl.includes(';') ||
-      (port > 0 && port !== 80 && port !== 443)
-    );
-  } catch (_) {
-    return false;
-  }
+  return streamUrl.includes('/;') || /:\/\/*[^/]+:\d+\/;/.test(streamUrl);
 }
 
 /**
@@ -359,7 +343,7 @@ function looksLikeShoutcastUrl(streamUrl) {
  * and by the PHP app on shared hosting via /api/capture.
  *
  * Many Shoutcast servers reply with "ICY 200 OK" (HTTP/0.9). Node fetch
- * rejects that, so we use a raw TCP reader (preferred for Gabz-style URLs).
+ * rejects that, so we use a raw TCP reader for those mounts (e.g. Gabz FM).
  */
 async function captureStreamAudio(streamUrl, seconds = sampleSeconds) {
   if (looksLikeShoutcastUrl(streamUrl)) {
@@ -460,10 +444,13 @@ function captureViaIcySocket(streamUrl, seconds = sampleSeconds) {
     const isTls = parsed.protocol === 'https:';
     const port = Number(parsed.port || (isTls ? 443 : 80));
     const path = streamRequestPath(parsed, streamUrl);
-    const byteBudget = seconds * 20000;
+    // Gabz is ~96kbps — budget a bit above that so we get a full sample
+    const byteBudget = Math.max(seconds * 16000, seconds * 20000);
     const chunks = [];
     let written = 0;
     let settled = false;
+    let headerBuf = Buffer.alloc(0);
+    let headerDone = false;
 
     const connectOpts = { host: parsed.hostname, port };
     let socket;
@@ -477,7 +464,7 @@ function captureViaIcySocket(streamUrl, seconds = sampleSeconds) {
       else resolve(buffer);
     };
 
-    const onData = (chunk) => {
+    const pushAudio = (chunk) => {
       if (!Buffer.isBuffer(chunk) || chunk.length === 0) return;
       const remaining = byteBudget - written;
       if (remaining <= 0) {
@@ -496,6 +483,31 @@ function captureViaIcySocket(streamUrl, seconds = sampleSeconds) {
       }
     };
 
+    const onData = (chunk) => {
+      if (!Buffer.isBuffer(chunk) || chunk.length === 0) return;
+
+      // Split response headers from audio body (was previously mixed in — broke Gabz)
+      if (!headerDone) {
+        headerBuf = Buffer.concat([headerBuf, chunk]);
+        const sep = headerBuf.indexOf('\r\n\r\n');
+        if (sep < 0) {
+          // Some ICY servers use bare LF
+          const sepLf = headerBuf.indexOf('\n\n');
+          if (sepLf < 0) return;
+          headerDone = true;
+          pushAudio(headerBuf.subarray(sepLf + 2));
+          headerBuf = Buffer.alloc(0);
+          return;
+        }
+        headerDone = true;
+        pushAudio(headerBuf.subarray(sep + 4));
+        headerBuf = Buffer.alloc(0);
+        return;
+      }
+
+      pushAudio(chunk);
+    };
+
     function onConnect() {
       const hostHeader = parsed.port
         ? `${parsed.hostname}:${parsed.port}`
@@ -503,7 +515,7 @@ function captureViaIcySocket(streamUrl, seconds = sampleSeconds) {
       socket.write(
         `GET ${path} HTTP/1.0\r\n` +
           `Host: ${hostHeader}\r\n` +
-          `User-Agent: Mozilla/5.0 (compatible; StreamShazam/1.0)\r\n` +
+          `User-Agent: Mozilla/5.0 (compatible; StreamID/1.0)\r\n` +
           `Icy-MetaData: 0\r\n` +
           `Accept: */*\r\n` +
           `Connection: close\r\n` +
