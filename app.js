@@ -736,9 +736,10 @@ function normalizeAcrCloudResponse(data) {
   }
 
   const meta = data.metadata || {};
+  // Prefer music DB matches (radio) over humming candidates
   const candidates = []
-    .concat(Array.isArray(meta.humming) ? meta.humming : [])
-    .concat(Array.isArray(meta.music) ? meta.music : []);
+    .concat(Array.isArray(meta.music) ? meta.music : [])
+    .concat(Array.isArray(meta.humming) ? meta.humming : []);
 
   if (!candidates.length) return empty;
 
@@ -938,12 +939,16 @@ async function downloadWhatsAppMedia(mediaId) {
   return { buffer, filename, mimeType };
 }
 
-/** Prefer local capture+Shazam on Render (reliable). PHP path is fallback only. */
+/** Prefer local capture+ACRCloud (Shazam quota exhausted). PHP is last-resort fallback. */
 async function identifyStream(streamUrl) {
-  if (rapidApiKey) {
+  if (acrCloudConfigured()) {
     return identifyLocally(streamUrl);
   }
-  console.warn('RAPIDAPI_KEY missing — falling back to PHP identify API');
+  if (rapidApiKey) {
+    console.warn('ACRCloud missing — falling back to Shazam (may be quota-limited)');
+    return identifyLocallyWithShazam(streamUrl);
+  }
+  console.warn('No local recognizer configured — falling back to PHP identify API');
   return identifyViaPhp(streamUrl);
 }
 
@@ -954,14 +959,14 @@ async function identifyLocally(streamUrl) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const audio = await captureWithRetries(streamUrl, sampleSeconds, 3);
-      const song = await recognizeWithShazam(audio);
+      const song = await recognizeWithAcrCloud(audio, 'sample.mp3');
 
       if (song.matched || attempt === 2) {
         return {
           ok: true,
           matched: Boolean(song.matched),
           capture: {
-            method: 'render-local',
+            method: 'render-local-acrcloud',
             bytes: audio.length,
             seconds: sampleSeconds,
             attempt,
@@ -976,6 +981,42 @@ async function identifyLocally(streamUrl) {
     } catch (err) {
       lastError = err;
       console.error(`Identify attempt ${attempt} failed:`, err.message || err);
+      if (attempt < 2) await sleep(1200);
+    }
+  }
+
+  throw lastError || new Error('Identify failed');
+}
+
+/** Legacy Shazam path — only used when ACRCloud is not configured. */
+async function identifyLocallyWithShazam(streamUrl) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const audio = await captureWithRetries(streamUrl, sampleSeconds, 3);
+      const song = await recognizeWithShazam(audio);
+
+      if (song.matched || attempt === 2) {
+        return {
+          ok: true,
+          matched: Boolean(song.matched),
+          capture: {
+            method: 'render-local-shazam',
+            bytes: audio.length,
+            seconds: sampleSeconds,
+            attempt,
+          },
+          song,
+          audio,
+        };
+      }
+
+      console.log('No match on attempt 1 — sampling again');
+      await sleep(1500);
+    } catch (err) {
+      lastError = err;
+      console.error(`Shazam identify attempt ${attempt} failed:`, err.message || err);
       if (attempt < 2) await sleep(1200);
     }
   }
@@ -1406,7 +1447,11 @@ app.get('/health', (_req, res) => {
     webAppUrl,
     usageIngestUrl,
     captureEndpoint: '/api/capture',
-    identifyMode: rapidApiKey ? 'render-local' : 'php-fallback',
+    identifyMode: acrCloudConfigured()
+      ? 'render-local-acrcloud'
+      : rapidApiKey
+        ? 'render-local-shazam'
+        : 'php-fallback',
     rapidapiConfigured: Boolean(rapidApiKey),
     acrcloudConfigured: acrCloudConfigured(),
     acrcloudHost: acrHost,
@@ -1495,7 +1540,13 @@ app.post('/', (req, res) => {
 app.listen(port, () => {
   console.log(`StreamID WhatsApp bot listening on port ${port}`);
   console.log(
-    `Identify mode: ${rapidApiKey ? 'render-local (capture+Shazam)' : 'php-fallback'}`
+    `Identify mode: ${
+      acrCloudConfigured()
+        ? 'render-local (capture+ACRCloud)'
+        : rapidApiKey
+          ? 'render-local (capture+Shazam)'
+          : 'php-fallback'
+    }`
   );
   console.log(
     `Humming (ACRCloud): ${acrCloudConfigured() ? `enabled @ ${acrHost}` : 'not configured'}`
